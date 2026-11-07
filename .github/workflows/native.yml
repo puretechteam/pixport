@@ -22,10 +22,10 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          # manylinux2014's ARM cross compiler is gcc 4.8, too old for libdeflate's ARM code
-          - os: ubuntu-latest
+          # built on an ARM machine: the cross compilers in maturin's images (gcc 4.8 and 7.5) are
+          # too old for libdeflate's and libjxl's code; the native manylinux image has gcc 10
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            manylinux: "2_28"
           - os: macos-latest
             target: universal2-apple-darwin
     runs-on: ${{ matrix.os }}
@@ -44,7 +44,7 @@ jobs:
           working-directory: native
           target: ${{ matrix.target }}
           args: --release --out dist
-          manylinux: ${{ matrix.manylinux || 'auto' }}
+          manylinux: auto
           before-script-linux: |
             command -v cmake > /dev/null 2>&1 || python3 -m pip install "cmake>=3.16"
       - uses: actions/upload-artifact@v4
