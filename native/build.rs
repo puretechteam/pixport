@@ -91,8 +91,9 @@ fn libjxl_source() -> PathBuf {
         .args(["metadata", "--format-version", "1", "--offline", "--manifest-path"])
         .arg(&manifest)
         .output()
-        .expect("can't run cargo metadata");
-    let text = String::from_utf8_lossy(&out.stdout);
+        .map(|o| (o.stdout, o.stderr))
+        .unwrap_or_else(|e| (Vec::new(), e.to_string().into_bytes()));
+    let text = String::from_utf8_lossy(&out.0);
     for part in text.split("\"manifest_path\":\"").skip(1) {
         let path = part.split('"').next().unwrap_or("").replace("\\\\", "\\");
         let Some(dir) = Path::new(&path).parent() else { continue };
@@ -101,5 +102,37 @@ fn libjxl_source() -> PathBuf {
             return dir.join("libjxl");
         }
     }
-    panic!("libjxl's source wasn't found (the jpegxl-src package); set PIXPORT_LIBJXL_SRC to a libjxl checkout");
+    // On a fresh machine `cargo metadata --offline` can fail (packages for other platforms aren't
+    // downloaded), but cargo has always unpacked the build-dependencies before running this script.
+    if let Some(dir) = from_registry() {
+        return dir;
+    }
+    panic!(
+        "libjxl's source wasn't found (the jpegxl-src package); set PIXPORT_LIBJXL_SRC to a libjxl checkout. cargo metadata said: {}",
+        String::from_utf8_lossy(&out.1).trim()
+    );
+}
+
+/// libjxl inside the unpacked jpegxl-src package in cargo's registry: CARGO_HOME, or ~/.cargo.
+fn from_registry() -> Option<PathBuf> {
+    let home = env::var_os("CARGO_HOME").map(PathBuf::from).or_else(|| {
+        env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")).map(|h| PathBuf::from(h).join(".cargo"))
+    })?;
+    let wanted = format!("jpegxl-src-{}", jpegxl_src_version());
+    for index in std::fs::read_dir(home.join("registry").join("src")).ok()?.flatten() {
+        let dir = index.path().join(&wanted).join("libjxl");
+        if dir.join("CMakeLists.txt").is_file() {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+/// The version Cargo.toml pins jpegxl-src to (`jpegxl-src = "=0.12.0"`), so an older copy in the
+/// registry is never picked up.
+fn jpegxl_src_version() -> String {
+    let manifest = Path::new(&env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let text = std::fs::read_to_string(manifest).expect("can't read Cargo.toml");
+    let line = text.lines().find(|l| l.trim_start().starts_with("jpegxl-src")).expect("jpegxl-src in Cargo.toml");
+    line.split('"').nth(1).expect("jpegxl-src's version").trim_start_matches('=').to_string()
 }
