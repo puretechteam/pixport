@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "pixport-native"
+version = "0.1.0"
+description = "Compiled decoders for pixport: the same pictures, much faster, and JPEG XL."
+license = "MIT"
+license-files = ["LICENSE", "THIRD-PARTY.md", "licenses/*"]
+authors = [{ name = "Pure Tech" }]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: 3"]
+
+[project.urls]
+Source = "https://github.com/puretechteam/pixport"
+
+[tool.maturin]
+module-name = "pixport_native"
+features = ["extension-module"]

@@ -1,0 +1,8 @@
+# On Windows the module carries the C and C++ runtimes inside (libjxl is C++), so it needs no
+# Visual C++ redistributable: Python ships vcruntime140.dll but not msvcp140.dll. A RUSTFLAGS
+# environment variable replaces this setting; add "-C target-feature=+crt-static" to it then.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

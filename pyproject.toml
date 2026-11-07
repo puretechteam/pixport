@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pixport"
+dynamic = ["version"]
+description = "Read camera RAW (CR2, CR3, NEF, ARW, ORF, RW2, RAF, PEF, DNG), GIMP XCF, OpenEXR, Radiance HDR and JPEG XL, and write PNG, TIFF, EXR, HDR and JPEG XL, in Python with NumPy."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Pure Tech" }]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+keywords = ["raw", "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2", "demosaic", "xcf", "gimp", "exr", "openexr", "hdr", "jpeg xl", "jxl"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.16,<0.17", "pillow>=10"]
+
+[project.scripts]
+pixport = "pixport.__main__:main"
+
+[project.urls]
+Source = "https://github.com/puretechteam/pixport"
+
+[tool.setuptools.dynamic]
+version = { attr = "pixport.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Any warning fails a test: each one is either fixed or listed here with the reason.
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py310"
