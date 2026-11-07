@@ -59,7 +59,11 @@ fn main() {
     } else {
         // the extension module is a shared library
         cfg.define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
-        let map = format!("-ffile-prefix-map={}=libjxl", src.display());
+        // -ffile-prefix-map is gcc 8+; older cross compilers (manylinux ARM) know only the debug one
+        let mut map = format!("-ffile-prefix-map={}=libjxl", src.display());
+        if !compiler_accepts(&target, &map) {
+            map = format!("-fdebug-prefix-map={}=libjxl", src.display());
+        }
         cfg.cflag(&map).cxxflag(&map);
     }
     let dst = cfg.build();
@@ -78,6 +82,22 @@ fn main() {
     } else if target.contains("linux") {
         println!("cargo:rustc-link-lib=stdc++");
     }
+}
+
+/// Whether the target's C compiler (as the cc crate picks it: CC_<target>, TARGET_CC, CC, or cc)
+/// takes `flag`: it preprocesses an empty file with it.
+fn compiler_accepts(target: &str, flag: &str) -> bool {
+    let cc = [format!("CC_{target}"), format!("CC_{}", target.replace('-', "_")), "TARGET_CC".into(), "CC".into()]
+        .iter()
+        .find_map(env::var_os)
+        .unwrap_or_else(|| "cc".into());
+    Command::new(cc)
+        .args([flag, "-x", "c", "-E", "-"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// The libjxl source tree: PIXPORT_LIBJXL_SRC, or the one inside the jpegxl-src package.
