@@ -8,12 +8,13 @@ import struct
 import zlib
 from pathlib import Path
 
+from . import limits
 from .errors import PixportError
 from .image import Image
 
 # what a damaged file makes the readers raise; read() turns these into PixportError
 DAMAGE = (struct.error, LookupError, ValueError, ArithmeticError, EOFError, zlib.error, MemoryError, RecursionError,
-          NotImplementedError, OverflowError)
+          NotImplementedError, OverflowError, TypeError, AttributeError)
 
 # fmt: (module, name, readable, writable)
 FORMATS: dict[str, tuple[str, str, bool, bool]] = {
@@ -76,21 +77,41 @@ def detect(path: str | os.PathLike) -> str:
             return ext
         if head[8:10] == b"CR":
             return "cr2"
-        return "dng" if ext not in RAW else ext
+        if ext in ("tif", "tiff") and not _is_dng(p, head[:2] == b"II"):
+            return "tiff"  # an ordinary TIFF: pixport writes these but doesn't read them
+        return "dng"
     if ext in FORMATS:
         return ext
     raise PixportError(f"{p.name} isn't a picture pixport reads")
 
 
-def read(path: str | os.PathLike, fmt: str | None = None, **options) -> Image:
+def _is_dng(path: Path, little: bool) -> bool:
+    """Whether a TIFF's first IFD has a DNGVersion tag."""
+    e = "<" if little else ">"
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+            f.seek(struct.unpack(e + "I", head[4:8])[0])
+            n = struct.unpack(e + "H", f.read(2))[0]
+            entries = f.read(12 * min(n, 2000))
+    except (OSError, struct.error, ValueError):
+        return False
+    return any(struct.unpack_from(e + "H", entries, i)[0] == 50706 for i in range(0, len(entries) - 11, 12))
+
+
+def read(path: str | os.PathLike, fmt: str | None = None, max_pixels: int | None = None, **options) -> Image:
     """Decode a picture. ``options`` go to the format's reader (for RAW: ``half=True`` for a
-    quick half-size picture, ``white_balance="camera"|"auto"|"daylight"``)."""
+    quick half-size picture, ``white_balance="camera"|"auto"|"daylight"``). ``max_pixels`` sets
+    the pixel budget for this call (see ``pixport.limits``; 2^28 by default)."""
+    if max_pixels is not None and int(max_pixels) < 1:
+        raise ValueError("max_pixels must be at least 1")  # a mistake in the call, not damage in the file
     fmt = (fmt or detect(path)).lower()
     entry = FORMATS.get(fmt)
     if entry is None or not entry[2]:
         raise PixportError(f"pixport doesn't read {fmt}")
     try:
-        img = _module(entry[0]).read(Path(path), fmt=fmt, **options)
+        with limits.budget(max_pixels):
+            img = _module(entry[0]).read(Path(path), fmt=fmt, **options)
     except PixportError:
         raise
     except OSError as e:
@@ -107,4 +128,11 @@ def write(img: Image, path: str | os.PathLike, fmt: str | None = None, **options
     entry = FORMATS.get(fmt)
     if entry is None or not entry[3]:
         raise PixportError(f"pixport doesn't write {fmt}")
-    _module(entry[0]).write(img, Path(path), **options)
+    try:
+        _module(entry[0]).write(img, Path(path), **options)
+    except PixportError:
+        raise
+    except OSError as e:
+        raise PixportError(f"Can't write {Path(path).name}: {e}") from None
+    except (struct.error, ValueError, OverflowError, MemoryError) as e:
+        raise PixportError(f"Can't write {Path(path).name} as {fmt} ({type(e).__name__}: {e})") from None

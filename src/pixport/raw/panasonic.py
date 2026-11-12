@@ -20,7 +20,7 @@ import numpy as np
 from .. import _accel
 from ..errors import PixportError, UnsupportedError
 from . import RawData, colour
-from .common import check_size, enough, need
+from .common import check_size, enough, need, plateau_white
 from .tiff import Tiff, camera_metadata
 
 # tag 0x09 -> 2x2 pattern (0=R 1=G 2=B)
@@ -196,5 +196,6 @@ def decode(path: Path, fmt: str = "rw2") -> RawData:
     raw.metadata["bits"] = bits
     jpg = ifd.get(0x2E)
     thumb = colour.exif_thumbnail(data, jpg.pos) if jpg is not None else None
+    raw.white = plateau_white(raw)
     colour.attach(raw, t, [], [thumb] if thumb else None)
     return raw

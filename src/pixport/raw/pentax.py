@@ -14,7 +14,7 @@ import numpy as np
 from .. import _accel
 from ..errors import PixportError
 from . import RawData, colour
-from .common import check_size, enough, masked_edges, need
+from .common import check_size, colour_black, enough, masked_edges, need, plateau_white
 from .ljpeg import build_lut
 from .tiff import Tiff, camera_metadata
 
@@ -109,12 +109,13 @@ def decode(path: Path, fmt: str = "pef") -> RawData:
     if mn is not None:
         bl = mn.ints(0x0200)
         if bl and len(bl) >= 4:
-            raw.black = np.array([[bl[0], bl[1]], [bl[2], bl[3]]], dtype=np.float64)
+            raw.black = colour_black(bl, raw.pattern)  # recorded per colour, R G G B
         wb = mn.ints(0x0201)
         if wb and len(wb) >= 4 and min(wb[:4]) > 0:
             g = (wb[1] + wb[2]) / 2
             raw.wb = (wb[0] / g, 1.0, wb[3] / g)
     raw.crop = masked_edges(cfa, raw.black, raw.white)
+    raw.white = plateau_white(raw)
     raw.metadata["bits"] = bits
     colour.attach(raw, t)
     return raw

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 
 // the caps every pixport reader keeps to
 const MAX_SIDE: u64 = 50_000;
-const MAX_PIXELS: u64 = 1 << 30;
+const MAX_PIXELS: u64 = 1 << 28; // pixport.limits' default; pixport passes its own budget when it differs
 // metadata boxes and ICC profiles bigger than this are damage
 const MAX_BOX: usize = 64 << 20;
 
@@ -239,7 +239,8 @@ mod ffi {
 // clean error instead of exhausting memory
 
 struct Budget {
-    left: AtomicIsize,
+    limit: AtomicIsize,
+    used: AtomicIsize,
 }
 
 const HEAD: usize = 16;
@@ -250,15 +251,16 @@ unsafe extern "C" fn budget_alloc(opaque: *mut c_void, size: usize) -> *mut c_vo
     let Some(total) = size.checked_add(HEAD) else { return std::ptr::null_mut() };
     let Ok(layout) = std::alloc::Layout::from_size_align(total, HEAD) else { return std::ptr::null_mut() };
     let cost = total as isize;
-    if b.left.fetch_sub(cost, Ordering::Relaxed) < cost {
-        b.left.fetch_add(cost, Ordering::Relaxed);
+    let before = b.used.fetch_add(cost, Ordering::Relaxed);
+    if before.saturating_add(cost) > b.limit.load(Ordering::Relaxed) {
+        b.used.fetch_sub(cost, Ordering::Relaxed);
         return std::ptr::null_mut();
     }
     // SAFETY: layout has a non-zero size; the size is kept in front of the block for budget_free
     unsafe {
         let p = std::alloc::alloc(layout);
         if p.is_null() {
-            b.left.fetch_add(cost, Ordering::Relaxed);
+            b.used.fetch_sub(cost, Ordering::Relaxed);
             return std::ptr::null_mut();
         }
         (p as *mut usize).write(total);
@@ -276,7 +278,7 @@ unsafe extern "C" fn budget_free(opaque: *mut c_void, address: *mut c_void) {
         let p = (address as *mut u8).sub(HEAD);
         let total = (p as *const usize).read();
         std::alloc::dealloc(p, std::alloc::Layout::from_size_align_unchecked(total, HEAD));
-        b.left.fetch_add(total as isize, Ordering::Relaxed);
+        b.used.fetch_sub(total as isize, Ordering::Relaxed);
     }
 }
 
@@ -291,7 +293,7 @@ struct Session {
 
 impl Session {
     fn new(encoder: bool, budget: isize) -> Res<Self> {
-        let budget = Box::new(Budget { left: AtomicIsize::new(budget) });
+        let budget = Box::new(Budget { limit: AtomicIsize::new(budget), used: AtomicIsize::new(0) });
         let mm = Box::new(ffi::MemoryManager {
             opaque: (&*budget as *const Budget).cast_mut().cast(),
             alloc: budget_alloc,
@@ -319,8 +321,9 @@ impl Session {
         }
     }
 
+    /// A new limit for everything libjxl holds, what it has already allocated included.
     fn set_budget(&self, bytes: u64) {
-        self.budget.left.store(isize::try_from(bytes).unwrap_or(isize::MAX), Ordering::Relaxed);
+        self.budget.limit.store(isize::try_from(bytes).unwrap_or(isize::MAX), Ordering::Relaxed);
     }
 }
 
@@ -350,11 +353,20 @@ fn threads() -> usize {
     }
 }
 
-fn check_size(w: u64, h: u64) -> Res<()> {
-    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE || w * h > MAX_PIXELS {
+fn check_size(w: u64, h: u64, max_pixels: u64) -> Res<()> {
+    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE || w * h > max_pixels {
         return Err(Damage::new(format!("JPEG XL: {w}x{h} pixels is past pixport's limits")));
     }
     Ok(())
+}
+
+/// A zeroed buffer of n values, or an error when the memory isn't there (a plain vec! would end
+/// the whole process).
+fn zeroed<T: Clone + Default>(n: usize) -> Res<Vec<T>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| bad("not enough memory for the picture"))?;
+    v.resize(n, T::default());
+    Ok(v)
 }
 
 fn encoding(srgb: bool, grey: bool) -> ffi::ColorEncoding {
@@ -434,20 +446,23 @@ impl BoxReader {
 /// Decode a file: the first frame's pixels and the metadata boxes, plus a second, pixel-less
 /// pass over animations to count their frames. An XYB picture whose ICC profile libjxl can't
 /// convert back to comes out as sRGB.
-fn decode(data: &[u8], to_srgb: bool) -> Res<Decoded> {
-    let mut d = match decode_pass(data, to_srgb, true) {
-        Err(_) if !to_srgb => decode_pass(data, true, true)?,
+fn decode(data: &[u8], to_srgb: bool, max_pixels: u64) -> Res<Decoded> {
+    let mut d = match decode_pass(data, to_srgb, true, max_pixels) {
+        // only a picture whose own colours libjxl can't give is tried again, as sRGB
+        Err(e) if !to_srgb && e.0 == COLOUR_FAIL => decode_pass(data, true, true, max_pixels)?,
         r => r?,
     };
     if d.animated {
-        let frames = decode_pass(data, to_srgb, false)?;
+        let frames = decode_pass(data, to_srgb, false, max_pixels)?;
         d.frames = frames.frames;
         d.durations = frames.durations;
     }
     Ok(d)
 }
 
-fn decode_pass(data: &[u8], to_srgb: bool, pixels: bool) -> Res<Decoded> {
+const COLOUR_FAIL: &str = "JPEG XL: can't convert the colours";
+
+fn decode_pass(data: &[u8], to_srgb: bool, pixels: bool, max_pixels: u64) -> Res<Decoded> {
     use ffi::*;
     let events = if pixels {
         DEC_BASIC_INFO | DEC_COLOR_ENCODING | DEC_FULL_IMAGE | DEC_JPEG_RECONSTRUCTION | DEC_BOX
@@ -488,7 +503,7 @@ fn decode_pass(data: &[u8], to_srgb: bool, pixels: bool) -> Res<Decoded> {
                         return Err(bad("damaged header"));
                     }
                     let (w, h) = (info.xsize as u64, info.ysize as u64);
-                    check_size(w, h)?;
+                    check_size(w, h, max_pixels)?;
                     // frames, reference frames and the render pipeline work on float planes
                     let planes = (info.num_color_channels.max(3) + info.num_extra_channels) as u64;
                     s.set_budget((w * h * planes * 4).saturating_mul(8).saturating_add(512 << 20));
@@ -524,7 +539,7 @@ fn decode_pass(data: &[u8], to_srgb: bool, pixels: bool) -> Res<Decoded> {
                         DEC_SUCCESS
                     };
                     if status != DEC_SUCCESS {
-                        return Err(bad("can't convert the colours"));
+                        return Err(Damage::new(COLOUR_FAIL));
                     }
                     let plain = is_enum
                         && orig.white_point == WHITE_D65
@@ -556,19 +571,19 @@ fn decode_pass(data: &[u8], to_srgb: bool, pixels: bool) -> Res<Decoded> {
                     }
                     let ptr: *mut c_void = match format.data_type {
                         TYPE_UINT8 => {
-                            let mut v = vec![0u8; size];
+                            let mut v = zeroed::<u8>(size)?;
                             let p = v.as_mut_ptr().cast();
                             out = Pixels::U8(v);
                             p
                         }
                         TYPE_UINT16 => {
-                            let mut v = vec![0u16; size.div_ceil(2)];
+                            let mut v = zeroed::<u16>(size.div_ceil(2))?;
                             let p = v.as_mut_ptr().cast();
                             out = Pixels::U16(v);
                             p
                         }
                         _ => {
-                            let mut v = vec![0f32; size.div_ceil(4)];
+                            let mut v = zeroed::<f32>(size.div_ceil(4))?;
                             let p = v.as_mut_ptr().cast();
                             out = Pixels::F32(v);
                             p
@@ -668,15 +683,17 @@ fn profile(dec: *mut c_void, target: c_int) -> Option<Vec<u8>> {
 /// primaries), hdr ("pq", "hlg" or None), original_bits, float, jpeg (the original JPEG can be
 /// rebuilt with jxl_to_jpeg). With `srgb`, other colour spaces are converted to sRGB.
 #[pyfunction]
-#[pyo3(signature = (data, srgb=false))]
+#[pyo3(signature = (data, srgb=false, max_pixels=None))]
 #[allow(clippy::type_complexity)]
 pub fn jxl_decode<'py>(
     py: Python<'py>,
     data: &[u8],
     srgb: bool,
+    max_pixels: Option<u64>,
 ) -> PyResult<(usize, usize, usize, u32, Bound<'py, PyAny>, Option<Bound<'py, PyBytes>>, Option<Bound<'py, PyBytes>>,
     Option<Bound<'py, PyBytes>>, Bound<'py, PyDict>)> {
-    let d = py.detach(|| decode(data, srgb)).map_err(|e| raise(py, e))?;
+    let max = max_pixels.unwrap_or(MAX_PIXELS).max(1);
+    let d = py.detach(|| decode(data, srgb, max)).map_err(|e| raise(py, e))?;
     let shape = [d.height, d.width, d.channels];
     let n = d.height * d.width * d.channels;
     let (bits, arr) = match d.pixels {
@@ -708,12 +725,14 @@ pub fn jxl_decode<'py>(
 
 /// The JPEG a JPEG XL file was losslessly recompressed from, rebuilt byte for byte.
 #[pyfunction]
-pub fn jxl_to_jpeg<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
-    let out = py.detach(|| to_jpeg(data)).map_err(|e| raise(py, e))?;
+#[pyo3(signature = (data, max_pixels=None))]
+pub fn jxl_to_jpeg<'py>(py: Python<'py>, data: &[u8], max_pixels: Option<u64>) -> PyResult<Bound<'py, PyBytes>> {
+    let max = max_pixels.unwrap_or(MAX_PIXELS).max(1);
+    let out = py.detach(|| to_jpeg(data, max)).map_err(|e| raise(py, e))?;
     Ok(PyBytes::new(py, &out))
 }
 
-fn to_jpeg(data: &[u8]) -> Res<Vec<u8>> {
+fn to_jpeg(data: &[u8], max_pixels: u64) -> Res<Vec<u8>> {
     use ffi::*;
     let s = Session::new(false, 256 << 20)?;
     let dec = s.handle;
@@ -733,13 +752,13 @@ fn to_jpeg(data: &[u8]) -> Res<Vec<u8>> {
                     if JxlDecoderGetBasicInfo(dec, &mut info) != DEC_SUCCESS {
                         return Err(bad("damaged header"));
                     }
-                    check_size(info.xsize as u64, info.ysize as u64)?;
+                    check_size(info.xsize as u64, info.ysize as u64, max_pixels)?;
                     let planes = (info.num_color_channels.max(3) + info.num_extra_channels) as u64;
                     s.set_budget((info.xsize as u64 * info.ysize as u64 * planes * 4).saturating_mul(4).saturating_add(512 << 20));
                 }
                 DEC_JPEG_RECONSTRUCTION => {
                     started = true;
-                    out = vec![0u8; data.len().saturating_mul(2).clamp(1 << 16, 1 << 30)];
+                    out = zeroed::<u8>(data.len().saturating_mul(2).clamp(1 << 16, 1 << 30))?;
                     JxlDecoderSetJPEGBuffer(dec, out.as_mut_ptr(), out.len());
                 }
                 DEC_JPEG_NEED_MORE_OUTPUT => {
@@ -749,6 +768,7 @@ fn to_jpeg(data: &[u8]) -> Res<Vec<u8>> {
                         return Err(bad("the JPEG is too big"));
                     }
                     let grow = out.len();
+                    out.try_reserve_exact(grow).map_err(|_| bad("not enough memory for the JPEG"))?;
                     out.resize(out.len() + grow, 0);
                     JxlDecoderSetJPEGBuffer(dec, out.as_mut_ptr().add(filled), out.len() - filled);
                 }
@@ -833,6 +853,7 @@ impl Session {
                 used = out.len() - avail;
                 if status == ffi::ENC_NEED_MORE_OUTPUT {
                     let grow = out.len();
+                    out.try_reserve_exact(grow).map_err(|_| bad("not enough memory for the file"))?;
                     out.resize(out.len() + grow, 0);
                     continue;
                 }
@@ -865,7 +886,7 @@ struct Settings<'a> {
 
 fn encode(f: &Frame<'_>, o: &Settings<'_>) -> Res<Vec<u8>> {
     let (w, h, c) = (f.width as u64, f.height as u64, f.channels);
-    check_size(w, h)?;
+    check_size(w, h, MAX_SIDE * MAX_SIDE)?; // pixels already in memory: only the sides are capped
     if !(1..=4).contains(&c) {
         return Err(Damage::new(format!("JPEG XL: can't write pixels with {c} channels")));
     }

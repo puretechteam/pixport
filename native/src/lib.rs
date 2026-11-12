@@ -68,7 +68,6 @@ fn pixport_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hdr::hdr_decode, m)?)?;
     m.add_function(wrap_pyfunction!(hdr::hdr_encode, m)?)?;
     m.add_function(wrap_pyfunction!(hdr::hdr_rgbe, m)?)?;
-    m.add_function(wrap_pyfunction!(xcf::xcf_rle_tile, m)?)?;
     m.add_function(wrap_pyfunction!(xcf::xcf_rle_level, m)?)?;
     m.add_function(wrap_pyfunction!(jxl::jxl_decode, m)?)?;
     m.add_function(wrap_pyfunction!(jxl::jxl_to_jpeg, m)?)?;

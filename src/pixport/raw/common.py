@@ -5,17 +5,18 @@ from __future__ import annotations
 
 import numpy as np
 
+from .. import limits
 from ..errors import PixportError
 
 MAX_SIDE = 50_000
-MAX_PIXELS = 1 << 30
 
 
 def check_size(width: int, height: int) -> None:
     if not isinstance(width, int) or not isinstance(height, int):
         raise PixportError("The picture's size is missing")
-    if not (0 < width <= MAX_SIDE and 0 < height <= MAX_SIDE) or width * height > MAX_PIXELS:
+    if not (0 < width <= MAX_SIDE and 0 < height <= MAX_SIDE):
         raise PixportError(f"A {width} x {height} picture is outside what pixport reads")
+    limits.check(width, height)
 
 
 def enough(data: bytes, off: int, samples: int, bits_each: float, what: str = "sensor data") -> None:
@@ -51,9 +52,26 @@ def unpack_bits(buf: bytes, count: int, bits: int, order: str = "msb") -> np.nda
             out[:, 0] = t[:, 0] | ((t[:, 1] & 15) << 8)
             out[:, 1] = (t[:, 1] >> 4) | (t[:, 2] << 4)
         return out.reshape(-1)
-    bitarr = np.unpackbits(a, bitorder="big" if order == "msb" else "little")[: count * bits].reshape(count, bits)
-    w = (1 << np.arange(bits - 1, -1, -1)) if order == "msb" else (1 << np.arange(bits))
-    return (bitarr.astype(np.uint32) @ w.astype(np.uint32)).astype(np.uint16)
+    if not 1 <= bits <= 16:
+        raise ValueError(f"Can't unpack {bits}-bit values")
+    # 8 values fill ``bits`` bytes exactly: each of the 8 comes from the same 3 bytes of every group
+    groups = -(-count // 8)
+    g = np.zeros((groups, bits + 2), np.uint8)
+    flat = np.zeros(groups * bits, np.uint8)
+    flat[: len(a)] = a
+    g[:, :bits] = flat.reshape(groups, bits)
+    del flat
+    out = np.empty((groups, 8), np.uint16)
+    mask = np.uint32((1 << bits) - 1)
+    for j in range(8):
+        at, sh = divmod(j * bits, 8)
+        if order == "msb":
+            word = (g[:, at].astype(np.uint32) << 16) | (g[:, at + 1].astype(np.uint32) << 8) | g[:, at + 2]
+            out[:, j] = (word >> np.uint32(24 - bits - sh)) & mask
+        else:
+            word = g[:, at].astype(np.uint32) | (g[:, at + 1].astype(np.uint32) << 8) | (g[:, at + 2].astype(np.uint32) << 16)
+            out[:, j] = (word >> np.uint32(sh)) & mask
+    return out.reshape(-1)[:count]
 
 
 def masked_black(img: np.ndarray, pattern: np.ndarray, left: int = 0, top: int = 0, mask=None) -> np.ndarray | float:
@@ -94,6 +112,28 @@ def saturation(img: np.ndarray, crop, nominal: float, black=0.0) -> float:
     if hi >= max(16, sample.size // 20000) and mx > float(np.max(black)) + 64:
         return float(mx)
     return float(nominal)
+
+
+def colour_black(levels, pattern: np.ndarray) -> np.ndarray:
+    """Black levels recorded per colour (R, G, G, B) placed on the 2 x 2 mosaic ``pattern``: the
+    first green in reading order takes the first G, the other the second."""
+    out = np.zeros((2, 2), np.float64)
+    greens = iter((levels[1], levels[2]))
+    for y in range(2):
+        for x in range(2):
+            c = int(pattern[y, x])
+            out[y, x] = levels[0] if c == 0 else (levels[3] if c == 2 else next(greens, levels[1]))
+    return out
+
+
+def plateau_white(raw) -> float:
+    """``raw.white`` for files that record only the bit depth: where the sensor really clips when
+    the picture shows it (as CR2 does), so clipped highlights reach white instead of turning pink
+    after white balance."""
+    if raw.cfa is None:
+        return float(raw.white)
+    crop = raw.crop or (0, 0, raw.cfa.shape[0], raw.cfa.shape[1])
+    return float(saturation(raw.cfa, crop, raw.white, raw.black))
 
 
 def _blocks(a: np.ndarray, h: int, w: int) -> np.ndarray:

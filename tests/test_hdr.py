@@ -154,7 +154,10 @@ def test_primaries_and_xyz(tmp_path):
     assert img.metadata["hdr_primaries"] == "XYZ"
     m = np.linalg.inv(np.array([[0.4124564, 0.3575761, 0.1804375], [0.2126729, 0.7151522, 0.0721750],
                                 [0.0193339, 0.1191920, 0.9503041]]))
-    assert np.allclose(img.pixels[0, 0], m @ base, rtol=1e-3, atol=1e-6)
+    bfd = np.array([[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367], [0.0389, -0.0685, 1.0296]])
+    d65 = np.array([0.3127 / 0.3290, 1.0, (1 - 0.3127 - 0.3290) / 0.3290])
+    adapt = np.linalg.inv(bfd) @ np.diag((bfd @ d65) / (bfd @ np.ones(3))) @ bfd
+    assert np.allclose(img.pixels[0, 0], m @ adapt @ base, rtol=1e-3, atol=1e-6)
 
 
 def test_detect_and_formats(tmp_path):
@@ -229,3 +232,24 @@ def test_native_rgbe_conversion_matches_numpy(monkeypatch):
     fast = hdr.float_to_rgbe(rgb)
     monkeypatch.setattr(hdr, "native", None)
     assert np.array_equal(fast, hdr.float_to_rgbe(rgb))
+
+
+def test_xyze_white_is_neutral_in_srgb(tmp_path):
+    # equal XYZ is Radiance's equal-energy white: it was (1.205, 0.948, 0.909) times the value
+    grey = bytes((128, 128, 128, 129))
+    p = tmp_path / "w.hdr"
+    p.write_bytes(b"#?RADIANCE\nFORMAT=32-bit_rle_xyze\n\n-Y 1 +X 4\n" + grey * 4)
+    px = pixport.read(p).pixels[0, 0]
+    assert np.ptp(px) < 1e-3 * px[0]
+    assert abs(px[0] - 1.0) < 1e-2
+
+
+def test_colorcorr_and_exposure_are_recorded_not_applied(tmp_path):
+    body = np.array([[200, 100, 50, 128]] * 10, np.uint8).tobytes()
+    base = hdr.rgbe_to_float(np.array([[200, 100, 50, 128]], np.uint8))[0]
+    p = tmp_path / "c.hdr"
+    p.write_bytes(_file(b"EXPOSURE=4\nCOLORCORR=2 0.5 1\n", "-Y 1 +X 10", body))
+    img = pixport.read(p)
+    assert np.array_equal(img.pixels[0, 0], base)
+    assert img.metadata["hdr_exposure"] == 4.0
+    assert img.metadata["hdr_colorcorr"] == (2.0, 0.5, 1.0)

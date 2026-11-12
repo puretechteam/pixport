@@ -135,14 +135,21 @@ class Image:
         each(band, range(0, px.shape[0], BAND))
         return result
 
+    def display_icc(self) -> bytes | None:
+        """The ICC profile that describes ``to_srgb``'s values: the file's own for ``"srgb"``
+        pictures, and none for ``"linear"`` ones, which ``to_srgb`` turns into sRGB itself (their
+        profile, usually with a linear curve, would make a viewer show them far too bright)."""
+        return self.metadata.get("icc") if self.transfer != "linear" else None
+
     def to_pil(self, bits: int = 8, **kw):
         """A Pillow image (needs Pillow), 8 bits per channel, or 16 for grey (Pillow's I;16)."""
         from PIL import Image as PILImage
         arr = self.to_srgb(bits=8 if bits == 8 or self.channels != 1 else 16, **kw)
         mode = {1: "L", 2: "LA", 3: "RGB", 4: "RGBA"}[arr.shape[2]]
         if arr.dtype == np.uint16:
-            return PILImage.fromarray(arr[:, :, 0], "I;16")
-        img = PILImage.fromarray(arr if arr.shape[2] > 1 else arr[:, :, 0], mode)
-        if self.metadata.get("icc"):
-            img.info["icc_profile"] = self.metadata["icc"]
+            img = PILImage.fromarray(np.ascontiguousarray(arr[:, :, 0]))  # uint16 grey is Pillow's I;16
+        else:
+            img = PILImage.fromarray(arr if arr.shape[2] > 1 else arr[:, :, 0], mode)
+        if self.display_icc():
+            img.info["icc_profile"] = self.display_icc()
         return img

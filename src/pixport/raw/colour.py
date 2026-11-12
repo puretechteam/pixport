@@ -17,7 +17,6 @@ SRGB_XYZ = np.array([[3.2404542, -1.5371385, -0.4985314],
 
 FROM_FILE = "matrix: the camera's own, from the file's maker note"
 FROM_DNG = "matrix: the file's DNG colour matrices"
-FROM_PREVIEW = "matrix: fitted from the camera's preview"
 NONE = "camera colour (no colour matrix found)"
 
 
@@ -107,5 +106,5 @@ def attach(raw, t, ifds=None, extra=None) -> None:
         m = from_thumbnail(t, raw, ifds, extra)
         if m is not None:
             raw.cam_xyz = m
-            raw.metadata["colour"] = FROM_PREVIEW
+            raw.metadata["colour"] = preview.FITTED
     raw.metadata.setdefault("colour", NONE if raw.cam_xyz is None else FROM_FILE)

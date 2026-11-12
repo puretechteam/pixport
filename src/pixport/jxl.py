@@ -18,12 +18,13 @@ from pathlib import Path
 
 import numpy as np
 
-from . import _accel
+from . import _accel, limits
 from .errors import PixportError, UnsupportedError
-from .image import Image
+from .image import Image, upright_exif
 
 DEFAULT_QUALITY = 90
 DEFAULT_EFFORT = 7
+NATIVE_MAX_PIXELS = 1 << 28  # the budget pixport-native keeps to when it is given none
 
 
 def _native():
@@ -50,9 +51,15 @@ def distance_from_quality(quality: float) -> float:
     return 53 / 3000 * q * q - 23 / 20 * q + 25
 
 
+def _budget() -> dict:
+    """pixport.limits' budget for pixport-native, when it isn't the default it already keeps to."""
+    n = limits.max_pixels()
+    return {} if n == NATIVE_MAX_PIXELS else {"max_pixels": n}
+
+
 def decode(data: bytes, srgb: bool = False) -> Image:
     """A JPEG XL file's bytes as an Image (see the module notes)."""
-    _w, _h, _c, bits, px, icc, exif, xmp, info = _native().jxl_decode(bytes(data), srgb=srgb)
+    _w, _h, _c, bits, px, icc, exif, xmp, info = _native().jxl_decode(bytes(data), srgb=srgb, **_budget())
     if bits == 8:
         pixels = px.astype(np.float32) / np.float32(255)
     elif bits == 16:
@@ -115,7 +122,8 @@ def encode(img: Image, quality: float = DEFAULT_QUALITY, lossless: bool = False,
     px, linear = _samples(img, lossless)
     md = img.metadata
     return n.jxl_encode(px, lossless=lossless, distance=float(distance), effort=int(effort),
-                        icc=None if linear else md.get("icc"), exif=md.get("exif"), xmp=md.get("xmp"), linear=linear)
+                        icc=None if linear else md.get("icc"), exif=upright_exif(md.get("exif")), xmp=md.get("xmp"),
+                        linear=linear)
 
 
 def write(img: Image, path: str | os.PathLike, quality: float = DEFAULT_QUALITY, lossless: bool = False,
@@ -133,4 +141,4 @@ def from_jpeg(data: bytes, effort: int = DEFAULT_EFFORT) -> bytes:
 
 def to_jpeg(data: bytes) -> bytes:
     """The JPEG a ``from_jpeg`` file was made from, byte for byte."""
-    return _native().jxl_to_jpeg(bytes(data))
+    return _native().jxl_to_jpeg(bytes(data), **_budget())

@@ -146,6 +146,8 @@ def parse(data: bytes, pos: int = 0, end: int | None = None) -> Frame:
             f.scan_start = p + 2 + length
             if not 1 <= f.predictor <= 7:
                 raise PixportError(f"Lossless JPEG predictor {f.predictor} isn't valid")
+            if f.pt >= f.precision:
+                raise PixportError("The lossless JPEG point transform isn't valid for its precision")
             for t in f.scan_tables:
                 if t not in f.tables:
                     raise PixportError("A lossless JPEG scan uses a missing Huffman table")

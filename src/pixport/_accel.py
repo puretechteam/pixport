@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 
-VERSION = "0.1.0"  # the pixport-native this pixport is made for (it ships with each release)
+VERSION = "0.2.0"  # the pixport-native this pixport is made for (it ships with each release)
 
 native = None
 if not os.environ.get("PIXPORT_PURE"):

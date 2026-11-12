@@ -288,5 +288,5 @@ def write(img: Image, path: Path, bits: int | None = None, **opts) -> None:
     if bits is None:
         bits = 16 if img.transfer == "linear" or img.metadata.get("bits", 8) > 8 else 8
     px = img.to_srgb(bits=bits, exposure=opts.get("exposure", 0.0), tonemap=opts.get("tonemap", "clip"))
-    Path(path).write_bytes(encode(px, exif=upright_exif(img.metadata.get("exif")), icc=img.metadata.get("icc"),
+    Path(path).write_bytes(encode(px, exif=upright_exif(img.metadata.get("exif")), icc=img.display_icc(),
                                   level=opts.get("level", LEVEL)))

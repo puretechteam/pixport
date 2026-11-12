@@ -1,5 +1,6 @@
 """TIFF writing, 8 or 16 bits a channel (Pillow can't write 16-bit colour): Deflate-compressed strips
-with the horizontal predictor, the ICC profile, and the camera, lens and date from the photo."""
+with the horizontal predictor, the ICC profile, and the camera's make and model and the date from the
+photo (as TIFF tags; the rest of the EXIF isn't carried)."""
 
 from __future__ import annotations
 
@@ -99,4 +100,4 @@ def write(img: Image, path: Path, bits: int | None = None, **opts) -> None:
     md = img.metadata
     text = {271: str(md.get("make", "") or ""), 272: str(md.get("model", "") or ""),
             306: str(md.get("datetime", "") or ""), 305: "pixport"}
-    Path(path).write_bytes(encode(px, icc=md.get("icc"), text=text, level=opts.get("level", 6)))
+    Path(path).write_bytes(encode(px, icc=img.display_icc(), text=text, level=opts.get("level", 6)))

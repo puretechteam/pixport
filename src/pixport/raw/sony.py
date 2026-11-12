@@ -18,7 +18,7 @@ import numpy as np
 from .. import _accel
 from ..errors import PixportError, UnsupportedError
 from . import RawData, colour, ljpeg
-from .common import check_size, need, padded_columns
+from .common import check_size, need, padded_columns, unpack_bits
 from .tiff import Tiff, camera_metadata, read_ifd
 
 
@@ -149,6 +149,7 @@ def decode(path: Path, fmt: str = "arw") -> RawData:
     md = camera_metadata(t)
     n = width * height
     shift = 0     # the SR2 levels are 14-bit; 12-bit packed data needs them shifted down
+    curve_top = None
     if comp == 7:
         tw, th = ifd.int(322), ifd.int(323)
         offs, sizes = ifd.ints(324) or [], ifd.ints(325) or []
@@ -163,7 +164,8 @@ def decode(path: Path, fmt: str = "arw") -> RawData:
             return i, samples, f
 
         jobs = range(min(len(offs), across * -(-height // th)))
-        res = ThreadPoolExecutor(max_workers=8).map(one, jobs) if _accel.has("ljpeg_decode") else map(one, jobs)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            res = list(pool.map(one, jobs)) if _accel.has("ljpeg_decode") else map(one, jobs)
         for i, s, f in res:
             top, left = (i // across) * th, (i % across) * tw
             tile = _sony_tile(s, f, th, tw)
@@ -172,21 +174,21 @@ def decode(path: Path, fmt: str = "arw") -> RawData:
             cfa[top:top + h, left:left + w] = tile[:h, :w]
     elif comp == 32767 or comp == 1:
         off = ifd.int(273)
+        if off is None:
+            raise PixportError("This ARW's sensor data has no offset")
         size = ifd.int(279, 0)
-        need(data, off or 0, 1)
+        need(data, off, 1)
         size = min(size, len(data) - off)
         if size >= n * 2:
             cfa = np.frombuffer(data, "<u2" if t.order == "<" else ">u2", n, off).reshape(height, width).astype(np.uint16)
         elif size >= n * 3 // 2 and comp == 32767 and size < n * 2 and size != n:
-            a = np.frombuffer(data, np.uint8, n * 3 // 2, off).reshape(-1, 3).astype(np.uint16)
-            out = np.empty((a.shape[0], 2), np.uint16)
-            out[:, 0] = a[:, 0] | ((a[:, 1] & 15) << 8)
-            out[:, 1] = (a[:, 1] >> 4) | (a[:, 2] << 4)
-            cfa = out.reshape(height, width)
+            cfa = unpack_bits(data[off:off + n * 3 // 2], n, 12, "lsb").reshape(height, width)
             shift = 2
         elif size >= n:
             pts = ifd.ints(0x7010) or [8000, 10400, 12900, 14100]
-            cfa = arw2(data, off, width, height, sony_curve(pts))
+            curve = sony_curve(pts)
+            cfa = arw2(data, off, width, height, curve)
+            curve_top = int(curve[min(0x7FF << 1, len(curve) - 1)])  # the top value an 11-bit delta reaches
         else:
             raise PixportError("This ARW's sensor data is smaller than its size")
     else:
@@ -209,6 +211,8 @@ def decode(path: Path, fmt: str = "arw") -> RawData:
         raw.white = float(max(wl[:3])) / (1 << shift)
     elif tag_white:
         raw.white = float(tag_white)
+    elif curve_top is not None:
+        raw.white = float(curve_top)
     else:
         raw.white = float((1 << bits) - 1)
     co, cs = ifd.ints(50719), ifd.ints(50720)
@@ -287,7 +291,8 @@ def _ycbcr(data: bytes, t: Tiff, ifd) -> RawData:
         return i, ljpeg.decode(data, off, min(len(data), off + size), chain=True, chain_rows=2)
 
     jobs = range(min(len(offs), across * -(-height // th)))
-    res = ThreadPoolExecutor(max_workers=8).map(one, jobs) if _accel.has("ljpeg_decode") else map(one, jobs)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        res = list(pool.map(one, jobs)) if _accel.has("ljpeg_decode") else map(one, jobs)
     for i, (s_, f) in res:
         if f.slots != [0, 0, 0, 0, 1, 2]:
             raise UnsupportedError("This Sony YCbCr layout isn't supported")

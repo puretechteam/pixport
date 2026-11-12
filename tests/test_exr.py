@@ -301,7 +301,11 @@ def test_chromaticities_convert_to_srgb(tmp_path):
     p = tmp_path / "xyz.exr"
     p.write_bytes(make_exr(xyz_pic, exr.NONE, attrs=chroma))
     img = pixport.read(p)
-    assert np.allclose(img.pixels[0, 0], [0.2, 0.4, 0.1], atol=1e-5)
+    # an XYZ file's white is equal-energy: adapted to D65 (Bradford) on the way to sRGB
+    bfd = np.array([[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367], [0.0389, -0.0685, 1.0296]])
+    d65 = np.array([0.3127 / 0.3290, 1.0, (1 - 0.3127 - 0.3290) / 0.3290])
+    adapt = np.linalg.inv(bfd) @ np.diag((bfd @ d65) / (bfd @ np.ones(3))) @ bfd
+    assert np.allclose(img.pixels[0, 0], np.linalg.inv(m709) @ adapt @ xyz, atol=1e-5)
     p.write_bytes(make_exr(pic, exr.NONE, attrs=_attr("chromaticities", "chromaticities",
                                                       struct.pack("<8f", 0.64, 0.33, 0.3, 0.6, 0.15, 0.06, 0.3127, 0.329))))
     assert np.allclose(pixport.read(p).pixels[0, 0], [0.2, 0.4, 0.1], atol=1e-3)
@@ -466,3 +470,30 @@ def test_native_piz_writer_matches_numpy(monkeypatch):
     slow = exr.piz_encode(flat, blk3)
     monkeypatch.setattr(exr, "native", _accel.native)
     assert exr.piz_encode(flat, blk3) == slow
+
+
+def _chroma_pic(prim, value, tmp_path):
+    pic = {k: np.full((2, 3), value, np.float32) for k in "RGB"}
+    p = tmp_path / "c.exr"
+    p.write_bytes(make_exr(pic, exr.NONE, attrs=_attr("chromaticities", "chromaticities", struct.pack("<8f", *prim))))
+    return pixport.read(p).pixels[0, 0]
+
+
+def test_aces_ap0_grey_stays_neutral(tmp_path):
+    # AP0 has a D60 white; without adapting it, grey 0.18 came out (1.047, 0.995, 0.915) times itself
+    ap0 = (0.7347, 0.2653, 0.0, 1.0, 0.0001, -0.0770, 0.32168, 0.33767)
+    px = _chroma_pic(ap0, 0.18, tmp_path)
+    assert np.ptp(px) < 1e-3
+    assert abs(px[1] - 0.18) < 5e-3
+
+
+def test_xyz_equal_energy_white_is_neutral(tmp_path):
+    px = _chroma_pic((1, 0, 0, 1, 0, 0, 1 / 3, 1 / 3), 1.0, tmp_path)
+    assert np.ptp(px) < 1e-3  # was (1.205, 0.948, 0.909)
+
+
+def test_d65_file_is_unchanged_by_adaptation():
+    assert np.array_equal(exr._adapt_to_d65((0.64, 0.33, 0.3, 0.6, 0.15, 0.06, 0.3127, 0.329)), np.eye(3))
+    # Rec.2020 (D65) goes straight through XYZ
+    r2020 = (0.708, 0.292, 0.170, 0.797, 0.131, 0.046, 0.3127, 0.3290)
+    assert np.allclose(exr.primaries_matrix(r2020), exr.XYZ_TO_SRGB @ exr.rgb_to_xyz(r2020))

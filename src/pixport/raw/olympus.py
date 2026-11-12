@@ -18,7 +18,7 @@ import numpy as np
 from .. import _accel
 from ..errors import PixportError
 from . import RawData, colour
-from .common import check_size, enough, need
+from .common import check_size, colour_black, enough, need, plateau_white, unpack_bits
 from .tiff import Tiff, camera_metadata
 
 
@@ -121,11 +121,7 @@ def decode(path: Path, fmt: str = "orf") -> RawData:
         cfa = np.frombuffer(data, "<u2" if t.order == "<" else ">u2", n, off).reshape(height, width).astype(np.uint16)
     elif size >= n * 3 // 2:
         # 12-bit packed, little-endian nibble order
-        a = np.frombuffer(data, np.uint8, n * 3 // 2, off).reshape(-1, 3).astype(np.uint16)
-        out = np.empty((a.shape[0], 2), np.uint16)
-        out[:, 0] = a[:, 0] | ((a[:, 1] & 15) << 8)
-        out[:, 1] = (a[:, 1] >> 4) | (a[:, 2] << 4)
-        cfa = out.reshape(height, width)
+        cfa = unpack_bits(data[off:off + n * 3 // 2], n, 12, "lsb").reshape(height, width)
     else:
         cfa = decode_compressed(data, off, width, height)
     md = camera_metadata(t)
@@ -148,8 +144,7 @@ def decode(path: Path, fmt: str = "orf") -> RawData:
                 raw.cam_xyz = colour.from_rgb_cam(m)
             bl = ip.ints(0x0600)
             if bl and len(bl) >= 4:
-                # per colour (R, G, G, B) -> per position of the RGGB mosaic
-                raw.black = np.array([[bl[0], bl[1]], [bl[2], bl[3]]], dtype=np.float64)
+                raw.black = colour_black(bl, raw.pattern)  # recorded per colour, R G G B
             vb = ip.ints(0x0611)
             if vb and 8 < vb[0] <= 16:
                 raw.white = float((1 << vb[0]) - 1)
@@ -159,5 +154,6 @@ def decode(path: Path, fmt: str = "orf") -> RawData:
                 if cw > 0 and ch > 0 and cl + cw <= width and ct + ch <= height:
                     raw.crop = (ct, cl, ch, cw)
     raw.metadata["bits"] = 12
+    raw.white = plateau_white(raw)
     colour.attach(raw, t)
     return raw

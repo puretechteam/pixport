@@ -60,17 +60,6 @@ fn tile(d: &[u8], mut pos: usize, end: usize, bpp: usize, npix: usize, out: &mut
     Ok(pos)
 }
 
-#[pyfunction]
-pub fn xcf_rle_tile<'py>(py: Python<'py>, data: PyBackedBytes, pos: usize, end: usize, bpp: usize, npix: usize)
-                         -> PyResult<(Bound<'py, PyBytes>, usize)> {
-    if bpp == 0 || bpp > 64 || npix > 4096 {
-        return Err(raise(py, Damage::new("The XCF tile size isn't valid")));
-    }
-    let mut out = vec![0u8; bpp * npix];
-    let p = tile(&data, pos, end, bpp, npix, &mut out).map_err(|e| raise(py, e))?;
-    Ok((PyBytes::new(py, &out), p))
-}
-
 /// A whole level of RLE tiles (64 x 64, row by row) as (h, w, bpp) bytes.
 fn level(d: &[u8], ptrs: &[u64], w: usize, h: usize, bpp: usize) -> Res<Vec<u8>> {
     let ntx = w.div_ceil(64);

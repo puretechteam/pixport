@@ -12,7 +12,7 @@ Formats (``pixport.formats()``): RAW from Canon (CR2, CR3), Nikon (NEF), Sony (A
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .errors import PixportError, UnsupportedError
 from .image import Image

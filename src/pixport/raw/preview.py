@@ -264,9 +264,7 @@ def _block_means(cfa, pattern, black, white, wb, crop, gh: int, gw: int):
     peak = np.maximum.reduceat(np.maximum.reduceat(view, r0, axis=0), c0, axis=2).max(axis=(1, 3))
     n = np.outer(np.diff(np.append(r0, ny)), np.diff(np.append(c0, nx)))                 # repeats per area
     blk = np.broadcast_to(np.asarray(black, np.float64), pattern.shape) if np.ndim(black) else np.full(pattern.shape, float(black))
-    # the pattern as seen from the view's first photosite
-    pat = np.roll(pattern, (-(y0 * ph) % ph, -(x0 * pw) % pw), axis=(0, 1))
-    blk = np.roll(blk, (-(y0 * ph) % ph, -(x0 * pw) % pw), axis=(0, 1))
+    pat = pattern  # the view starts on a whole repeat, so the pattern is as it is
     sums = np.zeros((gh, gw, 3))
     counts = np.zeros(3)
     for y in range(ph):
@@ -389,12 +387,6 @@ def cam_xyz(m: np.ndarray, wb) -> np.ndarray:
     matrix ``m`` and the white balance the camera colours were taken with."""
     wbv = np.asarray(wb, np.float64)
     return np.diag(wbv[1] / wbv) @ np.linalg.inv(m) @ np.linalg.inv(XYZ_RGB)
-
-
-def fit(cam: np.ndarray, ref: np.ndarray) -> np.ndarray | None:
-    """:func:`solve`'s matrix alone."""
-    got = solve(cam, ref)
-    return None if got is None else got[0]
 
 
 FITTED = "matrix: fitted from the camera's preview"

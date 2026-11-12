@@ -25,12 +25,13 @@ import numpy as np
 from .. import _accel
 from ..errors import PixportError, UnsupportedError
 from . import RawData, preview
-from .common import check_size, masked_black
+from .common import check_size, masked_black, plateau_white
 from .tiff import Tiff, camera_metadata
 
 CANON_UUID = bytes.fromhex("85c0b687820f11e08111f4ce462b6a48")
 CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"dinf"}
 MAX_TILES = 4096
+MAX_STEP = 0x168000      # the largest quantisation step
 MAX_ZEROS = 1 << 20     # leading zeros of a code before the data counts as damaged
 
 # JPEG-LS run-length order (ITU-T T.87, table J): a 1 bit adds 1 << J[s] repeats
@@ -257,6 +258,8 @@ def parse_tiles(hdr: Header, d: bytes, start: int, size: int) -> list[list[Tile]
                         band.data_size = band.size - word(pos + 16)
                     if band.data_size < 0 or band_at + band.size > at + plane.size:
                         raise ValueError("CRX subbands don't fit their plane")
+                    if b == 0 and band.data_size == 0:  # every picture codes its lowest band: none is a size with no data
+                        raise ValueError("A CRX plane has no picture data")
                     band_at += band.size
                     plane.bands.append(band)
                     pos += 4 + hsz
@@ -614,6 +617,12 @@ def _qstep(q: np.ndarray | int):
     return np.where(sh < 6, base >> np.clip(6 - sh, 0, 63), base << np.clip(sh - 6, 0, 40))
 
 
+def plain_step(q: int) -> int:
+    """A subband's step from the old header's q, at most the largest the per-tile maps allow (a
+    bigger q is damage; unclamped, its step wraps to 0 in the int32 the coefficients use)."""
+    return min(int(_qstep(q)), MAX_STEP)
+
+
 def _qp_maps(qp: np.ndarray, levels: int) -> list[np.ndarray]:
     """Steps per level, coarsest first, from the tile's map (one value per 8 x 2 of a plane)."""
     h = qp.shape[0]
@@ -640,7 +649,7 @@ def _dequant_map(coef: np.ndarray, band: Band, qmap: np.ndarray, shift: int, x0:
     cols = np.clip((np.arange(w) - x0) >> shift, 0, min(last, qmap.shape[1] - 1))
     cols[:x0] = 0
     step = band.q_base + ((qmap[rows][:, cols] * band.q_mult) >> 3)
-    return coef * np.clip(step, 1, 0x168000).astype(np.int32)
+    return coef * np.clip(step, 1, MAX_STEP).astype(np.int32)
 
 
 def synth(low: np.ndarray, high: np.ndarray, n: int, lo: bool, hi: bool, axis: int) -> np.ndarray:
@@ -688,7 +697,7 @@ def decode_tile(d: bytes, hdr: Header, tile: Tile, plane: Plane, tw: int, th: in
         b = plane.bands[idx]
         v = decode_band(d, b.offset, b.data_size, w, h, plane.predicted and idx == 0)
         if qmaps is None:
-            st = int(_qstep(b.q))
+            st = plain_step(b.q)
             return v * np.int32(st) if st != 1 else v
         # level: 1 finest .. nlev coarsest; the coarsest maps come first
         shift = 3 - level
@@ -860,6 +869,7 @@ def decode(path: Path, fmt: str = "cr3") -> RawData:
             raw.black[y, x] = black[p]
     else:
         raw.black = masked_black(cfa, pattern, left=raw.crop[1], top=raw.crop[0])
+    raw.white = plateau_white(raw)
     # CR3 has no colour matrix: fit one from the camera's thumbnail (the THMB box)
     preview.attach(raw, d[c.thumb[0]:c.thumb[1]] if c.thumb[1] > c.thumb[0] else None)
     md["bits"] = hdr.bits
@@ -876,7 +886,7 @@ def _levels(cd: np.ndarray | None) -> tuple:
                        32: (0x55, 0x157), 33: (0x55, 0x157), 34: (0x55, 0x157)}.get(ver, (None, None))
     if at_wb is None:
         # another layout: the as-shot levels are the first R, G, G, B with equal greens near 1024
-        at_wb = next((i for i in range(0x3F, 0x60) if cd[i + 1] == cd[i + 2] and 512 <= cd[i + 1] <= 2048
+        at_wb = next((i for i in range(0x3F, min(0x60, len(cd) - 3)) if cd[i + 1] == cd[i + 2] and 512 <= cd[i + 1] <= 2048
                       and 64 <= cd[i] <= 16384 and 64 <= cd[i + 3] <= 16384), None)
     wb = None
     if at_wb is not None:

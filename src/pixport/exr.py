@@ -28,14 +28,15 @@ from pathlib import Path
 
 import numpy as np
 
+from . import limits
 from ._accel import native
 from .errors import PixportError, UnsupportedError
-from .hdr import linearise
+from .hdr import _expand, linearise
 from .image import Image, each
 
 MAGIC = b"\x76\x2f\x31\x01"
 MAX_SIDE = 50_000
-MAX_PIXELS = 1_000_000_000
+PAD_LIMIT = 1 << 24  # display-window pixels past which empty padding around the data isn't made
 UINT, HALF, FLOAT = 0, 1, 2
 _SIZE = {UINT: 4, HALF: 2, FLOAT: 4}
 _DTYPE = {UINT: np.dtype("<u4"), HALF: np.dtype("<f2"), FLOAT: np.dtype("<f4")}
@@ -63,17 +64,34 @@ def rgb_to_xyz(prim) -> np.ndarray:
 XYZ_TO_SRGB = np.linalg.inv(rgb_to_xyz(_REC709))
 
 
+_BRADFORD = np.array([[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367], [0.0389, -0.0685, 1.0296]])
+
+
+def _white_xyz(wx: float, wy: float) -> np.ndarray:
+    return np.array([wx / wy, 1.0, (1 - wx - wy) / wy])
+
+
+def _adapt_to_d65(prim) -> np.ndarray:
+    """The Bradford matrix taking XYZ under these primaries' white to XYZ under sRGB's D65 (the
+    identity when the white already is D65, to four decimals)."""
+    if abs(prim[6] - _REC709[6]) < 1e-4 and abs(prim[7] - _REC709[7]) < 1e-4:
+        return np.eye(3)
+    src = _BRADFORD @ _white_xyz(prim[6], prim[7])
+    dst = _BRADFORD @ _white_xyz(_REC709[6], _REC709[7])
+    return np.linalg.inv(_BRADFORD) @ np.diag(dst / src) @ _BRADFORD
+
+
 def primaries_matrix(prim) -> np.ndarray | None:
     """The matrix taking RGB in these primaries to linear sRGB, or None when they're already
-    sRGB's (to four decimals). Like OpenEXR's own tools, through XYZ without adapting the white."""
+    sRGB's (to four decimals). A white other than D65 (ACES's D60, an XYZ file's equal-energy
+    white) is adapted to D65 with the Bradford transform, so a neutral stays neutral."""
     try:
         prim = tuple(float(v) for v in prim)
         if len(prim) != 8 or not all(math.isfinite(v) for v in prim):
             return None
         if max(abs(a - b) for a, b in zip(prim, _REC709)) < 1e-4:
             return None
-        # absolute colorimetry, as OpenEXR's own tools convert (no white point adaptation)
-        out = XYZ_TO_SRGB @ rgb_to_xyz(prim)
+        out = XYZ_TO_SRGB @ _adapt_to_d65(prim) @ rgb_to_xyz(prim)
     except (ValueError, np.linalg.LinAlgError, ZeroDivisionError):
         return None
     return out if np.all(np.isfinite(out)) else None
@@ -221,8 +239,9 @@ def _part(attrs: dict, flags: int, multi: bool) -> Part:
             raise PixportError(f"The EXR header is damaged (no {key})")
     chans = attrs["channels"]
     dw, disp = attrs["dataWindow"], attrs["displayWindow"]
-    if not isinstance(chans, list) or not isinstance(dw, tuple) or not isinstance(disp, tuple) or len(dw) != 4:
-        raise PixportError("The EXR header is damaged")
+    if (not isinstance(chans, list) or not isinstance(dw, tuple) or not isinstance(disp, tuple) or len(dw) != 4
+            or len(disp) != 4 or not all(isinstance(v, int) for v in dw + disp)):
+        raise PixportError("The EXR header is damaged (its data or display window)")
     kind = attrs.get("type")
     if not isinstance(kind, str):
         kind = "tiledimage" if flags & 0x200 else ("deepscanline" if flags & 0x800 else "scanlineimage")
@@ -230,8 +249,9 @@ def _part(attrs: dict, flags: int, multi: bool) -> Part:
     if not isinstance(comp, int):
         raise PixportError("The EXR header is damaged (compression)")
     w, h = dw[2] - dw[0] + 1, dw[3] - dw[1] + 1
-    if w < 1 or h < 1 or w > MAX_SIDE or h > MAX_SIDE or w * h > MAX_PIXELS:
+    if w < 1 or h < 1 or w > MAX_SIDE or h > MAX_SIDE:
         raise PixportError(f"The EXR data window ({w} x {h}) is out of range")
+    limits.check(w, h, "EXR data window")
     for c in chans:
         if c.type not in _SIZE:
             raise PixportError(f"The EXR channel {c.name!r} has an unknown pixel type ({c.type})")
@@ -417,18 +437,6 @@ def rle_unpack(raw: bytes, size: int) -> bytes:
     if total != size:
         raise PixportError("The EXR run-length data is damaged (wrong size)")
     return _expand(raw, starts, lengths, steps, size).tobytes()
-
-
-def _expand(raw: bytes, starts, lengths, steps, total: int) -> np.ndarray:
-    if total == 0:
-        return np.zeros(0, np.uint8)
-    src = np.frombuffer(raw, np.uint8)
-    st = np.asarray(starts, np.int64)
-    ln = np.asarray(lengths, np.int64)
-    sp = np.asarray(steps, np.int64)
-    first = np.repeat(np.cumsum(ln) - ln, ln)
-    ramp = np.arange(total, dtype=np.int64) - first
-    return src[np.repeat(st, ln) + ramp * np.repeat(sp, ln)]
 
 
 # ---------------------------------------------------------------- Huffman (PIZ, DWA)
@@ -649,9 +657,6 @@ def huf_encode(values: np.ndarray) -> bytes:
         raise PixportError("Can't write this picture with PIZ (a Huffman code is too long)")
     codes = _canonical(lengths)
     # the token stream: (code, length) pairs, and 8-bit counts after run codes
-    n_tok = sym.size
-    tok_code = []
-    tok_len = []
     # small runs expand into repeated symbols
     expand = np.where(big, 1, rep + 1)
     s_exp = np.repeat(sym, expand)
@@ -672,7 +677,6 @@ def huf_encode(values: np.ndarray) -> bytes:
     tok_len[bi + 1] = lengths[rlc]
     tok_code[bi + 2] = rep[big]
     tok_len[bi + 2] = 8
-    del n_tok
     nbits = int(tok_len.sum())
     bits = _pack_bits(tok_code, tok_len, nbits)
     table = _huf_pack_table(lengths, im, rlc)
@@ -1340,6 +1344,8 @@ def read_part(data: bytes, part: Part, multi: bool, index: int = 0, only: set[st
                 raise PixportError("The EXR file is damaged (a chunk runs past the end)")
             if (y - y0) % lines or not y0 <= y <= y1:
                 raise PixportError("The EXR file is damaged (a chunk for a line outside the picture)")
+            if y != y0 + i * lines:  # the table lists the chunks top to bottom, whatever their order in the file
+                raise PixportError("The EXR file is damaged (a chunk isn't the one its offset table names)")
             by1 = min(y + lines - 1, y1)
             blk = _block(part, x0, y, x1, by1)
             res = _decode(part, data[off + head + 8: off + head + 8 + size], blk)
@@ -1364,7 +1370,7 @@ def read_part(data: bytes, part: Part, multi: bool, index: int = 0, only: set[st
             if multi and struct.unpack_from("<i", data, off)[0] != index:
                 raise PixportError("The EXR file is damaged (a tile of another part)")
             tx, ty, lx, ly, size = struct.unpack_from("<5i", data, off + head)
-            if lx or ly or not (0 <= tx < ntx and 0 <= ty < nty):
+            if lx or ly or (tx, ty) != (i % ntx, i // ntx):
                 raise PixportError("The EXR file is damaged (a tile out of place)")
             if size < 0 or off + head + 20 + size > n:
                 raise PixportError("The EXR file is damaged (a tile runs past the end)")
@@ -1554,8 +1560,16 @@ def read(path: Path, fmt: str = "exr", part: int | None = None, **_options) -> I
     # place the data window in the display window
     dx0, dy0, dx1, dy1 = p.disp
     dwid, dhgt = dx1 - dx0 + 1, dy1 - dy0 + 1
-    if dwid < 1 or dhgt < 1 or dwid > MAX_SIDE or dhgt > MAX_SIDE or dwid * dhgt > MAX_PIXELS:
+    if dwid < 1 or dhgt < 1 or dwid > MAX_SIDE or dhgt > MAX_SIDE:
         raise PixportError(f"The EXR display window ({dwid} x {dhgt}) is out of range")
+    cropped = None
+    if dwid * dhgt > PAD_LIMIT and dwid * dhgt > 64 * rgb.shape[0] * rgb.shape[1]:
+        # a display window far larger than the pixels the file holds (a few bytes can claim one of
+        # gigapixels): the picture is the data window instead
+        cropped = p.disp
+        dx0, dy0, dx1, dy1 = x0, y0, x1, y1
+    else:
+        limits.check(dwid, dhgt, "EXR display window")
     if (dx0, dy0, dx1, dy1) != (x0, y0, x1, y1):
         canvas = np.zeros((dhgt, dwid, rgb.shape[2]), np.float32)
         sx0, sy0 = max(x0, dx0), max(y0, dy0)
@@ -1577,6 +1591,8 @@ def read(path: Path, fmt: str = "exr", part: int | None = None, **_options) -> I
         meta["chromaticities"] = prim
     if alpha_note:
         meta["exr_alpha"] = alpha_note
+    if cropped is not None:
+        meta["exr_cropped"] = "the display window is far larger than the data the file holds: the picture is its data window"
     for key, mkey in (("whiteLuminance", "white_luminance"), ("pixelAspectRatio", "pixel_aspect"),
                       ("owner", "owner"), ("comments", "comments"), ("capDate", "date"), ("view", "view"),
                       ("multiView", "views"), ("xDensity", "dpi")):

@@ -4,7 +4,7 @@ Read camera RAW photos (Canon CR2 and CR3, Nikon NEF, Sony ARW, Olympus and OM S
 
 ```
 pip install git+https://github.com/puretechteam/pixport
-pip install https://github.com/puretechteam/pixport/releases/download/v0.1.0/pixport_native-0.1.0-cp310-abi3-win_amd64.whl
+pip install https://github.com/puretechteam/pixport/releases/download/v0.2.0/pixport_native-0.2.0-cp310-abi3-win_amd64.whl
 ```
 
 The second line is optional for everything but JPEG XL: it's the compiled add-on for 64-bit Windows (each [release](https://github.com/puretechteam/pixport/releases) has Linux and macOS wheels too). Without it pixport reads and writes the rest the same way with its NumPy code, more slowly: a big RAW photo takes up to a minute.
@@ -24,37 +24,40 @@ or from a terminal:
 ```
 pixport photo.nef photo.png
 pixport render.exr render.jpg --exposure -1
+pixport scan.exr scan.png --bits 8        # PNG and TIFF: 16 bits a channel for RAW, EXR, HDR and deep XCF, unless told
 pixport --formats
 ```
 
+**Hostile files.** A header is a few bytes and can claim a picture of any size, so every reader checks the claimed size before it makes anything for it: past 2^28 pixels (268 million, a 16384 x 16384 picture, above the point where Pillow refuses) `pixport.read` raises `pixport.limits.TooLargeError`, a `PixportError`. `pixport.read(path, max_pixels=n)` allows more for one call, and `pixport.limits.MAX_PIXELS` sets it for the process. Readers also refuse files far too short for the picture they claim.
+
 ## Why pixport?
 
-[ConvertAll](https://github.com/puretechteam/ConvertAll), a drag-and-drop file converter, used ImageMagick (about 60 MB to install) for these formats. pixport replaces it there: on the same files it is faster, its RAW PNGs are smaller, and its pictures match LibRaw's and OpenEXR's. It's a sibling of [meshport](https://github.com/puretechteam/meshport) (3D), [packport](https://github.com/puretechteam/packport) (archives) and [bookport](https://github.com/puretechteam/bookport) (ebooks and documents).
+[Latheport](https://github.com/puretechteam/Latheport), a drag-and-drop file converter and editor (called ConvertAll until 1.5), used ImageMagick (about 60 MB to install) for these formats until pixport replaced it in 1.4: on the same files it is faster, its RAW PNGs are smaller, and its pictures match LibRaw's and OpenEXR's. It's a sibling of [meshport](https://github.com/puretechteam/meshport) (3D), [packport](https://github.com/puretechteam/packport) (archives) and [bookport](https://github.com/puretechteam/bookport) (ebooks and documents).
 
 ## What it reads and writes
 
 | Format | Read | Write |
 |---|---|---|
-| Camera RAW: CR2 (with sRAW and mRAW), CR3 (with cRAW), NEF (Nikon's High Efficiency RAW excepted), ARW (with Sony's medium and small RAW), ORF, RW2, RAF (Bayer and X-Trans), PEF, DNG | ✓ | |
+| Camera RAW: CR2 (with sRAW and mRAW), CR3 (with cRAW), NEF (Nikon's High Efficiency RAW and small NEF excepted), ARW (with Sony's medium and small RAW), ORF, RW2, RAF (Bayer and X-Trans), PEF, DNG | ✓ | |
 | GIMP XCF (8 to 32 bits, layers, masks, groups, every layer mode) | ✓ | |
 | OpenEXR (scanline and tiled, multi-part, every compression: RLE, ZIPS, ZIP, PIZ, PXR24, B44, B44A, DWAA, DWAB) | ✓ | ✓ (ZIP or PIZ) |
 | Radiance HDR (RGBE) | ✓ | ✓ |
 | JPEG XL (with pixport-native) | ✓ | ✓ (lossy, lossless, and a JPEG repacked without loss) |
 | PNG, TIFF | | ✓ (8 or 16 bits a channel) |
 
-**Camera RAW** is developed the way LibRaw (and so ImageMagick) does by default: black and white levels, the camera's white balance, demosaicing, the camera's colour matrix, automatic brightness and the BT.709 curve, turned as the camera was held, with EXIF kept. The colour matrix comes from the file when it has one (DNG, Olympus, Sony) or is fitted to the camera's own preview of the same picture; `img.metadata["colour"]` says which. `pixport.raw.develop` takes `half=True` (a quick half-size picture), `white_balance="daylight"` and `tone="linear"` for scene-linear values.
+**Camera RAW** is developed the way LibRaw (and so ImageMagick) does by default: black and white levels, the camera's white balance, demosaicing, the camera's colour matrix, automatic brightness and the BT.709 curve, turned as the camera was held, with EXIF kept. The colour matrix comes from the file when it has one (DNG, Olympus, Sony) or is fitted to the camera's own preview of the same picture; `img.metadata["colour"]` says which. `pixport.read` takes `half=True` (a quick half-size picture), `white_balance="daylight"` and `tone="linear"` for scene-linear values.
 
-**XCF** pictures are composited as GIMP 2.10 shows them, in linear light. **EXR** keeps every part, channel and layer the file has; the picture is its display window, as OpenEXR defines it. **JPEG XL** goes through libjxl, the reference library; `pixport.jxl.from_jpeg` repacks a JPEG into JPEG XL without changing a pixel, and `to_jpeg` gives the very same JPEG back.
+**XCF** pictures are composited as GIMP 2.10 shows them, in linear light. **EXR** keeps every part, channel and layer the file has; the picture is its display window, as OpenEXR defines it (unless that window is more than 64 times the pixels the file holds and over 16 million pixels, which a few bytes can claim: then it is the data window, and `metadata["exr_cropped"]` says so). EXR and HDR pictures whose primaries have a white other than D65 (ACES's D60, an XYZ file's equal-energy white) are adapted to D65 with the Bradford transform, so greys stay grey. An HDR file's `EXPOSURE` and `COLORCORR` are kept in `metadata["hdr_exposure"]` and `metadata["hdr_colorcorr"]` but not applied: the stored pixels are shown as they are, as other viewers do. **JPEG XL** goes through libjxl, the reference library; `pixport.jxl.from_jpeg` repacks a JPEG into JPEG XL without changing a pixel, and `to_jpeg` gives the very same JPEG back.
 
 **PNG** is written as small as it losslessly goes: 16 bits that only hold 8 become 8, an opaque alpha channel is dropped, grey stays grey, 256 colours or fewer become a palette, and the filter (one for the band, or each row's own) and zlib strategy are chosen per band of rows by packing a sample each way. It packs on several cores. With pixport-native the packing is libdeflate's: on photos about 4 times as fast as zlib at the same size, and 4 to 6% smaller on HDR, XCF and JPEG XL pictures.
 
 ## Speed and size
 
-Measured on the same PC against ImageMagick 7.1.2, one conversion at a time, the two taking turns on each file, best of 3, with pixport-native installed and Python already running, as ConvertAll calls it (the `pixport` command adds about 0.25 s of start-up to each file):
+Measured on the same PC against ImageMagick 7.1.2, one conversion at a time, the two taking turns on each file, best of 3, with pixport-native installed and Python already running, as Latheport calls it (the `pixport` command adds about 0.25 s of start-up to each file):
 
 | Files | ImageMagick | pixport |
 |---|---|---|
-| 12 RAW photos (Apple DNG, Canon CR2 and CR3, sRAW, mRAW) → 16-bit PNG, through ConvertAll | 91.7 s, 1,054 MB | 59.0 s, 1,032 MB (10 of 12 faster) |
+| 12 RAW photos (Apple DNG, Canon CR2 and CR3, sRAW, mRAW) → 16-bit PNG, through Latheport | 91.7 s, 1,054 MB | 59.0 s, 1,032 MB (10 of 12 faster) |
 | 71 EXR files → PNG | 25.7 s, 71 MB | 19.3 s, 92.5 MB; 26.5 MB at `bits=8` (48 of 71 faster, the others within 0.4 s) |
 | 16 HDR files → PNG | 28.2 s, 39 MB | 12.4 s, 51 MB; 18 MB at `bits=8` (every one faster) |
 | 28 XCF files → PNG (ImageMagick with `-flatten`) | 7.1 s, 3.6 MB | 4.5 s, 3.1 MB (22 of 28 faster) |
@@ -66,7 +69,7 @@ HDR and EXR PNGs come out bigger than ImageMagick's at 16 bits a channel, for a 
 
 ## How it's tested
 
-The suite has 378 tests (with `PIXPORT_PURE=1`, 295 run in pure Python and 78 that need pixport-native skip); any warning fails one. Against these oracles:
+The suite has 410 tests with pixport-native installed (with `PIXPORT_PURE=1`, 325 run in pure Python and 80 that need pixport-native skip); any warning fails one. Against these oracles:
 
 - **LibRaw** (through rawpy): the raw sensor values of 70 of 76 RAW files from 11 makers (raw.pixls.us, CC0) are bit for bit the same; the other 6 store full colour instead of a mosaic (Canon sRAW and mRAW, Sony's medium and small ARW) and are checked by colour. Against ImageMagick's developed pictures the median colour difference is ΔE2000 2.08 (no file above 4.1) and the median PSNR 36.5 dB; the difference is the colour matrix, which ImageMagick takes from Adobe's tables.
 - **OpenEXR 3**: 251 of 251 parts of the OpenEXR sample images decode to the same values, every compression included; ImageMagick fails on 14 mipmapped files and mixes up stereo views.
@@ -74,7 +77,7 @@ The suite has 378 tests (with `PIXPORT_PURE=1`, 295 run in pure Python and 78 th
 - **XCF**: files built in the tests for every precision, compression and colour mode, and every layer mode checked against values worked out from GIMP's definitions.
 - **Pillow** and **OpenCV** read back every PNG and TIFF written (8 and 16 bits, palettes, every filter), and a decoder written in the tests apart from pixport's code checks each filter.
 - **pixport-native against NumPy**: the same results both ways for every decoder and the PNG filter.
-- **Damaged files** (cut short, impossible sizes and counts) raise `pixport.PixportError`, never anything else, without huge allocations.
+- **Damaged and hostile files** (cut short, impossible sizes and counts, a few bytes claiming gigapixels) raise `pixport.PixportError`, never anything else, without huge allocations; so do write errors (a folder that isn't there, a picture too big for the format).
 
 ## Development
 
@@ -86,7 +89,7 @@ python -m venv .venv
 
 pixport-native needs Rust, maturin, CMake and a C++17 compiler (it builds libjxl from source): `maturin develop --release -m native/Cargo.toml`. On Windows, with Visual Studio 2022's CMake on PATH, set `CMAKE_GENERATOR=Visual Studio 17 2022` if a newer Visual Studio is installed too. A Rust build keeps the paths of its sources; for a wheel you'll hand out, set `RUSTFLAGS=--remap-path-prefix=%USERPROFILE%=~` first (the release's wheels are built by GitHub Actions). libjxl's own paths are trimmed by `native/build.rs`.
 
-Code layout (`src/pixport/`): `image.py` (the Image, sRGB curves), `registry.py` (formats, read, write), `png.py`, `tiffwrite.py`, `exr.py`, `hdr.py`, `xcf.py`, `jxl.py`; `raw/` with a TIFF reader, lossless JPEG, a module per maker, `develop.py` and the colour matrices (`colour.py`, `preview.py`); `_accel.py` loads pixport-native, whose Rust source is in `native/`.
+Code layout (`src/pixport/`): `image.py` (the Image, sRGB curves), `registry.py` (formats, read, write), `limits.py` (the pixel budget), `png.py`, `tiffwrite.py`, `exr.py`, `hdr.py`, `xcf.py`, `jxl.py`; `raw/` with a TIFF reader, lossless JPEG, a module per maker, `develop.py` and the colour matrices (`colour.py`, `preview.py`); `_accel.py` loads pixport-native, whose Rust source is in `native/`.
 
 ## Credits
 

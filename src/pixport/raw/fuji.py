@@ -23,7 +23,7 @@ import numpy as np
 from .. import _accel
 from ..errors import PixportError, UnsupportedError
 from . import RawData, preview
-from .common import check_size, need
+from .common import check_size, need, plateau_white
 from .tiff import Tiff, camera_metadata
 
 MAGIC = b"FUJIFILMCCD-RAW "
@@ -470,6 +470,7 @@ def decode(path: Path, fmt: str = "raf") -> RawData:
             raw.crop = (top, left, ch, cw)
     if raw.crop is None:
         raw.crop = (0, 0, h, w)
+    raw.white = plateau_white(raw)
     # RAF has no colour matrix: fit one from the camera's thumbnail (the EXIF's IFD1)
     preview.attach(raw, _thumbnail(d, tiff))
     md["bits"] = bits

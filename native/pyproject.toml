@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pixport-native"
-version = "0.1.0"
+version = "0.2.0"
 description = "Compiled decoders for pixport: the same pictures, much faster, and JPEG XL."
 license = "MIT"
 license-files = ["LICENSE", "THIRD-PARTY.md", "licenses/*"]

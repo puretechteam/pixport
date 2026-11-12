@@ -26,12 +26,12 @@ from pathlib import Path
 
 import numpy as np
 
+from . import limits
 from ._accel import native
 from .errors import PixportError, UnsupportedError
 from .image import Image, srgb_to_linear
 
 MAX_SIDE = 50_000
-MAX_PIXELS = 1_000_000_000
 TILE = 64
 
 # precision codes (XCF 7 and later): (bytes per sample, kind, linear)
@@ -105,16 +105,6 @@ class _Reader:
         if pos + 4 > self.n:
             raise PixportError("The XCF file is cut short")
         return struct.unpack_from(">I", self.d, pos)[0]
-
-    def i32(self, pos: int) -> int:
-        if pos + 4 > self.n:
-            raise PixportError("The XCF file is cut short")
-        return struct.unpack_from(">i", self.d, pos)[0]
-
-    def f32(self, pos: int) -> float:
-        if pos + 4 > self.n:
-            raise PixportError("The XCF file is cut short")
-        return struct.unpack_from(">f", self.d, pos)[0]
 
     def string(self, pos: int) -> tuple[str, int]:
         k = self.u32(pos)
@@ -214,8 +204,9 @@ def _header(data: bytes) -> tuple[_Image, int]:
     pos = 14
     width, height, base = r.u32(pos), r.u32(pos + 4), r.u32(pos + 8)
     pos += 12
-    if width < 1 or height < 1 or width > MAX_SIDE or height > MAX_SIDE or width * height > MAX_PIXELS:
+    if width < 1 or height < 1 or width > MAX_SIDE or height > MAX_SIDE:
         raise PixportError(f"The XCF canvas ({width} x {height}) is out of range")
+    limits.check(width, height, "XCF canvas")
     if base > 2:
         raise PixportError("The XCF colour mode is damaged")
     precision = 150
@@ -253,8 +244,9 @@ def _layer(r: _Reader, img: _Image, pos: int) -> Layer:
         raise PixportError("The XCF file is damaged (a layer pointer outside the file)")
     w, h, typ = r.u32(pos), r.u32(pos + 4), r.u32(pos + 8)
     name, pos = r.string(pos + 12)
-    if w > MAX_SIDE or h > MAX_SIDE or w * h > MAX_PIXELS or typ > 5:
+    if w > MAX_SIDE or h > MAX_SIDE or typ > 5:
         raise PixportError(f"The XCF layer {name!r} is damaged (size or type)")
+    limits.check(w, h, f"XCF layer {name!r}")
     props, pos = _props(r, pos, img.version)
     hptr = _pointer(r, pos, img.ptr)
     mptr = _pointer(r, pos + img.ptr, img.ptr)
@@ -291,9 +283,8 @@ def _layer(r: _Reader, img: _Image, pos: int) -> Layer:
 
 def rle_tile(data: bytes, pos: int, end: int, bpp: int, npix: int) -> tuple[bytes, int]:
     """One RLE tile: bpp streams of npix bytes each (the first byte of every pixel, then the
-    second, ...), returned pixel-interleaved, and where the tile's data ended."""
-    if native is not None and hasattr(native, "xcf_rle_tile"):
-        return native.xcf_rle_tile(data, pos, end, bpp, npix)
+    second, ...), returned pixel-interleaved, and where the tile's data ended. (With pixport-native
+    a whole level is decoded at once instead, by xcf_rle_level.)"""
     starts, lengths, steps = [], [], []
     for _ in range(bpp):
         left = npix
@@ -488,15 +479,25 @@ def _to_space(rgb: np.ndarray, src: int, dst: int) -> np.ndarray:
 
 
 def _linear_to_srgb_ext(x: np.ndarray) -> np.ndarray:
-    a = np.abs(x)
-    v = np.where(a <= 0.0031308, a * 12.92, 1.055 * np.power(a, 1 / 2.4, dtype=np.float32) - 0.055)
-    return (np.sign(x) * v).astype(np.float32)
+    """The sRGB curve extended to negative values (mirrored), in one float32 array: the power
+    is only taken where it's used."""
+    a = np.abs(x, dtype=np.float32)
+    hi = a > np.float32(0.0031308)
+    np.power(a, np.float32(1 / 2.4), out=a, where=hi)
+    np.multiply(a, np.float32(1.055), out=a, where=hi)
+    np.subtract(a, np.float32(0.055), out=a, where=hi)
+    np.multiply(a, np.float32(12.92), out=a, where=np.logical_not(hi, out=hi))
+    return np.copysign(a, x, out=a)
 
 
 def _srgb_to_linear_ext(x: np.ndarray) -> np.ndarray:
-    a = np.abs(x)
-    v = np.where(a <= 0.04045, a / 12.92, np.power((a + 0.055) / 1.055, 2.4, dtype=np.float32))
-    return (np.sign(x) * v).astype(np.float32)
+    a = np.abs(x, dtype=np.float32)
+    hi = a > np.float32(0.04045)
+    np.add(a, np.float32(0.055), out=a, where=hi)
+    np.divide(a, np.float32(1.055), out=a, where=hi)
+    np.power(a, np.float32(2.4), out=a, where=hi)
+    np.divide(a, np.float32(12.92), out=a, where=np.logical_not(hi, out=hi))
+    return np.copysign(a, x, out=a)
 
 
 _D65 = np.array([0.95047, 1.0, 1.08883], np.float32)
@@ -716,8 +717,11 @@ def _composite(back: np.ndarray, layer: np.ndarray, opacity: np.ndarray, mode: i
         keep = _hash_noise(la.shape[0], la.shape[1], y0, x0) < la
         la = keep.astype(np.float32)
         mode = NORMAL
-    if mode in (NORMAL_LEGACY, NORMAL, DISSOLVE, BEHIND, BEHIND_LEGACY, ERASE, MERGE, SPLIT, COLOR_ERASE,
-                COLOR_ERASE_LEGACY):
+    # Normal with a composite mode other than union (clip to backdrop or layer, intersection) is
+    # composited as the other modes are, its blend being the layer itself
+    normal_clip = mode == NORMAL and comp_mode not in (0, UNION)
+    if not normal_clip and mode in (NORMAL_LEGACY, NORMAL, DISSOLVE, BEHIND, BEHIND_LEGACY, ERASE, MERGE, SPLIT,
+                                    COLOR_ERASE, COLOR_ERASE_LEGACY):
         cspace = comp_space or (PERCEPTUAL if mode <= COLOR_ERASE_LEGACY else LINEAR)
         if mode <= COLOR_ERASE_LEGACY:
             cspace = PERCEPTUAL
@@ -772,7 +776,9 @@ def _composite(back: np.ndarray, layer: np.ndarray, opacity: np.ndarray, mode: i
     bspace = blend_space or dflt[0]
     cspace = comp_space or dflt[1]
     cmode = comp_mode or dflt[2]
-    if bspace == LAB:
+    if normal_clip:
+        comp = _to_space(layer[..., :3], work, cspace)
+    elif bspace == LAB:
         ba = _lab(_to_space(back[..., :3], work, LINEAR))
         lb = _lab(_to_space(layer[..., :3], work, LINEAR))
         comp = _to_space(_unlab(_blend(mode, ba, lb)), LINEAR, cspace)
@@ -829,6 +835,8 @@ def _identity_outside(mode: int, comp_mode: int) -> bool:
     if mode in (PASS_THROUGH,):
         return False
     cm = comp_mode or _default_spaces(mode)[2]
+    if mode == NORMAL and cm not in (UNION, CLIP_BACKDROP):  # clipped to the layer: nothing is left outside it
+        return False
     if mode <= COLOR_ERASE_LEGACY or mode in (NORMAL, BEHIND, ERASE, MERGE, SPLIT, COLOR_ERASE):
         return True
     return cm in (UNION, CLIP_BACKDROP)
@@ -963,11 +971,10 @@ def read(path: Path, fmt: str = "xcf", **_options) -> Image:
     comp = _Compositor(r, img, LINEAR)
     tree = _tree(img.layers)
     canvas = comp.stack(tree)
-    rgb, alpha = canvas[..., :3], np.clip(canvas[..., 3:], 0.0, 1.0)
+    # the result is made in the canvas itself: a full-size copy less at the peak
+    np.clip(canvas[..., 3], 0.0, 1.0, out=canvas[..., 3])
     if not linear:
-        rgb = _linear_to_srgb_ext(rgb)
-    if img.base == 1:
-        rgb = rgb[..., :1]
+        canvas[..., :3] = _linear_to_srgb_ext(canvas[..., :3])
     size = _PRECISION[img.precision][0]
     meta: dict = {"bits": {1: 8, 2: 16}.get(size, 32),
                   "xcf_version": img.version, "xcf_precision": img.precision,
@@ -982,5 +989,5 @@ def read(path: Path, fmt: str = "xcf", **_options) -> Image:
         xr, yr = struct.unpack_from(">ff", img.props[19])
         if xr > 0 and yr > 0:
             meta["dpi"] = (xr, yr)
-    px = np.concatenate([rgb, alpha], axis=2).astype(np.float32)
-    return Image(np.ascontiguousarray(px), "linear" if linear else "srgb", meta, "xcf")
+    px = canvas[..., [0, 3]] if img.base == 1 else canvas
+    return Image(np.ascontiguousarray(px, dtype=np.float32), "linear" if linear else "srgb", meta, "xcf")

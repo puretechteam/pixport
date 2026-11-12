@@ -23,7 +23,8 @@ from .ljpeg import build_lut
 from .tiff import Tiff, camera_metadata
 
 # Nikon's Huffman tables (code counts for lengths 1-16, then symbols): 12-bit lossy, 12-bit
-# lossy after the split row, 12-bit lossless, then the same three for 14 bits
+# lossy after the split row, 12-bit lossless, then the same three for 14 bits. They are fixed by
+# the format (no NEF carries its own), so every NEF reader holds these same numbers.
 TREES = (
     ((0, 1, 5, 1, 1, 1, 1, 1, 1, 2, 0, 0, 0, 0, 0, 0), (5, 4, 3, 6, 2, 7, 1, 0, 8, 9, 11, 10, 12, 0)),
     ((0, 1, 5, 1, 1, 1, 1, 1, 1, 2, 0, 0, 0, 0, 0, 0), (0x39, 0x5A, 0x38, 0x27, 0x16, 5, 4, 3, 2, 1, 0, 11, 12, 12)),
@@ -92,8 +93,8 @@ def _predict(diffs: np.ndarray, height: int, width: int, vpred: list[int]) -> np
     return np.clip(out, 0, 0x3FFF).astype(np.uint16)
 
 
-def _curve(meta: bytes, order: str, bits: int) -> tuple[np.ndarray, int, int, list[int], int, int]:
-    """(curve, tree, split row, vpred, max, white) from the linearization table (0x96)."""
+def _curve(meta: bytes, order: str, bits: int) -> tuple[np.ndarray, int, int, list[int], int]:
+    """(curve, tree, split row, vpred, white) from the linearization table (0x96)."""
     if len(meta) < 12:
         raise PixportError("The NEF linearization table is cut short")
     ver0, ver1 = meta[0], meta[1]
@@ -113,6 +114,8 @@ def _curve(meta: bytes, order: str, bits: int) -> tuple[np.ndarray, int, int, li
         if ver1 == 0x40:
             # the newer 14-bit lossy files code 12-bit values: the curve spans a quarter
             step, top = step // 4, top // 4
+            if step < 1:
+                raise PixportError("The NEF curve is damaged (too many points)")
         n = min(csize, (len(meta) - p - 10) // 2)
         pts = np.array(struct.unpack_from(order + f"{n}H", meta, p + 10), dtype=np.int64)
         if n < csize:
@@ -130,13 +133,13 @@ def _curve(meta: bytes, order: str, bits: int) -> tuple[np.ndarray, int, int, li
         top = n
     while top > 2 and curve[top - 2] == curve[top - 1]:
         top -= 1
-    return curve.astype(np.uint16), tree, split, vpred, top, int(curve[max(0, top - 1)])
+    return curve.astype(np.uint16), tree, split, vpred, int(curve[max(0, top - 1)])
 
 
 def decode_compressed(data: bytes, off: int, width: int, height: int, meta: bytes, order: str, bits: int):
     """The mosaic of a Huffman-coded NEF: (uint16 array, white level)."""
     enough(data, off, width * height, 2, "NEF data")
-    curve, tree, split, vpred, _top, white = _curve(meta, order, bits)
+    curve, tree, split, vpred, white = _curve(meta, order, bits)
     if _accel.has("nikon_decode"):
         out = _accel.native.nikon_decode(data, off, width, height, tree_lut(tree),
                                          tree_lut(tree + 1) if split else tree_lut(tree), split, np.array(vpred, np.int64))
@@ -173,12 +176,15 @@ def decode(path: Path, fmt: str = "nef") -> RawData:
     md = camera_metadata(t)
     white = float((1 << bits) - 1)
     n = width * height
+    kind = mn.int(0x93) if mn is not None else None  # NEFCompression
+    if kind in (13, 14):
+        raise UnsupportedError("Nikon's High Efficiency RAW (HE and HE*) isn't supported")
+    if kind == 8:
+        raise UnsupportedError("Nikon's small NEF (sRAW) isn't supported")
     if comp == 34713 and size * 8 < n * bits:
         meta = mn[0x96].raw() if mn is not None and 0x96 in mn else None
         if meta is None:
             raise PixportError("This compressed NEF has no linearization table")
-        if mn is not None and mn.int(0x93) in (8, 9, 10):
-            raise UnsupportedError("Nikon's High Efficiency RAW (TicoRAW) isn't supported")
         cfa, white = decode_compressed(data, off, width, height, meta, mn[0x96].order, bits)
         white = float(white)
     elif size >= n * 2:

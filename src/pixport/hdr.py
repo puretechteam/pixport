@@ -15,12 +15,12 @@ from pathlib import Path
 
 import numpy as np
 
+from . import limits
 from ._accel import native
 from .errors import PixportError, UnsupportedError
 from .image import Image, srgb_to_linear
 
 MAX_SIDE = 50_000
-MAX_PIXELS = 1_000_000_000
 _RES = re.compile(rb"^([-+])([XY])\s+(\d+)\s+([-+])([XY])\s+(\d+)\s*$")
 _SRGB_PRIMARIES = (0.640, 0.330, 0.300, 0.600, 0.150, 0.060, 0.3127, 0.3290)
 
@@ -114,7 +114,7 @@ def _expand(data: bytes, starts: list, lengths: list, steps: list, total: int) -
     ln = np.asarray(lengths, np.int64)
     sp = np.asarray(steps, np.int64)
     if int(ln.sum()) != total:
-        raise PixportError("The HDR pixel data is damaged")
+        raise PixportError("The pixel data is damaged (its runs don't add up)")
     first = np.repeat(np.cumsum(ln) - ln, ln)
     ramp = np.arange(total, dtype=np.int64) - first
     return src[np.repeat(st, ln) + ramp * np.repeat(sp, ln)]
@@ -122,8 +122,12 @@ def _expand(data: bytes, starts: list, lengths: list, steps: list, total: int) -
 
 def _decode_old(data: bytes, pos: int, width: int) -> tuple[np.ndarray, int]:
     """One scanline in the flat or old run-length form (4-byte pixels, (1,1,1,n) repeats)."""
-    out = np.empty((width, 4), np.uint8)
     n = len(data)
+    if pos + 4 * width <= n:
+        flat = np.frombuffer(data, np.uint8, 4 * width, pos).reshape(width, 4)
+        if not ((flat[:, 0] == 1) & (flat[:, 1] == 1) & (flat[:, 2] == 1)).any():
+            return flat.copy(), pos + 4 * width  # a flat scanline (no repeats): all at once
+    out = np.empty((width, 4), np.uint8)
     i = 0
     shift = 0
     while i < width:
@@ -151,6 +155,8 @@ def _decode_old(data: bytes, pos: int, width: int) -> tuple[np.ndarray, int]:
 
 def decode_rgbe(data: bytes, pos: int, lines: int, width: int) -> np.ndarray:
     """(lines, width, 4) RGBE bytes from the pixel data at pos."""
+    if len(data) - pos < lines * (4 if width == 1 else 8):  # a scanline takes 8 bytes at the least
+        raise PixportError("The HDR pixel data is too short for the picture's size")
     if native is not None and hasattr(native, "hdr_decode"):
         return np.frombuffer(native.hdr_decode(data, pos, lines, width), np.uint8).reshape(lines, width, 4)
     rows = []
@@ -235,8 +241,9 @@ def read(path: Path, fmt: str = "hdr", **_options) -> Image:
     info, pos, res = _header(data)
     s1, a1, n1, s2, _a2, n2 = res
     n1, n2 = int(n1), int(n2)
-    if n1 < 1 or n2 < 1 or n1 > MAX_SIDE or n2 > MAX_SIDE or n1 * n2 > MAX_PIXELS:
+    if n1 < 1 or n2 < 1 or n1 > MAX_SIDE or n2 > MAX_SIDE:
         raise PixportError(f"The HDR picture's size ({n2} x {n1}) is out of range")
+    limits.check(n2, n1, "Radiance picture")
     fmt_name = info.get("format", "32-bit_rle_rgbe")
     if fmt_name not in ("32-bit_rle_rgbe", "32-bit_rle_xyze"):
         raise UnsupportedError(f"pixport doesn't read HDR pixels in the {fmt_name} format")
@@ -253,16 +260,18 @@ def read(path: Path, fmt: str = "hdr", **_options) -> Image:
         if s2 == b"+":
             rgb = rgb[::-1]
     rgb = np.ascontiguousarray(rgb)
-    if "colorcorr" in info:
-        rgb = rgb / np.asarray(info["colorcorr"], np.float32)
+    # EXPOSURE and COLORCORR are recorded, not applied: the stored pixels are shown as they are,
+    # as other viewers do
     meta = {"hdr_exposure": info["exposure"]}
+    if "colorcorr" in info:
+        meta["hdr_colorcorr"] = info["colorcorr"]
     for k in ("software", "gamma", "pixaspect", "view"):
         if k in info:
             meta["hdr_" + k] = info[k]
     if fmt_name == "32-bit_rle_xyze":
-        from .exr import XYZ_TO_SRGB
-        rgb = np.einsum("ij,hwj->hwi", XYZ_TO_SRGB.astype(np.float32), rgb).astype(np.float32)
         meta["hdr_primaries"] = "XYZ"
+        # XYZ with Radiance's equal-energy white, adapted to sRGB's D65
+        rgb = _to_srgb_primaries(rgb, (1, 0, 0, 1, 0, 0, 1 / 3, 1 / 3))
     elif "primaries" in info:
         meta["hdr_primaries"] = info["primaries"]
         rgb = _to_srgb_primaries(rgb, info["primaries"])

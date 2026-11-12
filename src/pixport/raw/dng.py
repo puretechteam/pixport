@@ -112,7 +112,8 @@ def _tiles(ifd: Ifd, width: int, height: int):
     rps = ifd.int(278, height) or height
     if not offs or len(sizes) < len(offs):
         raise PixportError("This DNG's strip table is missing")
-    return [(offs[i], sizes[i], i * rps, 0, rps, width) for i in range(len(offs))]
+    n = min(len(offs), -(-height // rps))
+    return [(offs[i], sizes[i], i * rps, 0, min(rps, height - i * rps), width) for i in range(n)]  # the last strip may be short
 
 
 def _unpredict(a: np.ndarray, pred: int, spp: int, bits: int) -> np.ndarray:
@@ -155,7 +156,8 @@ def _decode_tile(data: bytes, off: int, size: int, rows: int, cols: int, spp: in
         return samples.reshape(-1)[:n].reshape(rows, cols * spp)
     if comp == 8:
         try:
-            buf = zlib.decompressobj().decompress(data[off:end], n * 8 + 64)
+            # never more than the tile needs: whole bytes a sample, a padded byte a row
+            buf = zlib.decompressobj().decompress(data[off:end], n * -(-bits // 8) + rows + 64)
         except zlib.error as e:
             raise PixportError(f"A DNG Deflate tile is damaged: {e}") from None
         if sample_format == 3:
@@ -242,7 +244,8 @@ def decode(path: Path, fmt: str = "dng") -> RawData:
         return p, _decode_tile(data, off, size, rows, cols, spp, bits, comp, pred, t.order, fmt_)
 
     jobs = len(pieces) > 1 and comp == 7 and _accel.has("ljpeg_decode")
-    results = ThreadPoolExecutor(max_workers=8).map(one, pieces) if jobs else map(one, pieces)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(one, pieces)) if jobs else map(one, pieces)
     for (off, size, top, left, rows, cols), tile in results:
         if top >= height or left >= width:
             continue

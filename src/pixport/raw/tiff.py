@@ -68,6 +68,7 @@ class Ifd(dict):
     def __init__(self, pos: int, base: int, order: str, data: bytes):
         super().__init__()
         self.pos, self.base, self.order, self.data, self.next = pos, base, order, data, 0
+        self.dropped = 0  # entries whose values would be outside the file
 
     def int(self, tag: int, default=None):
         e = self.get(tag)
@@ -117,6 +118,7 @@ def read_ifd(data: bytes, pos: int, base: int, order: str) -> Ifd:
         if size > 4:
             vpos = struct.unpack_from(order + "I", data, vpos)[0] + base
         if vpos < 0 or vpos + size > n:
+            ifd.dropped += 1
             continue
         ifd[tag] = Entry(tag, typ, cnt, vpos, order, data)
     if end + 4 <= n:
@@ -140,10 +142,11 @@ class Tiff:
         if m not in magic:
             raise PixportError("The file isn't TIFF-structured")
         self.magic = m
-        self._seen: set[int] = set()
+        self._parsed: dict[tuple, Ifd | None] = {}
         self.ifds: list[Ifd] = []
-        off = first
-        while off and len(self.ifds) < 64:
+        off, chain = first, set()
+        while off and len(self.ifds) < 64 and off + base not in chain:
+            chain.add(off + base)
             ifd = self.ifd(off + base, base)
             if ifd is None:
                 break
@@ -151,15 +154,19 @@ class Tiff:
             off = ifd.next
 
     def ifd(self, pos: int, base: int | None = None, order: str | None = None) -> Ifd | None:
-        """The IFD at absolute ``pos``, or None when it's outside the file or already read
-        (a loop) or there are too many."""
-        if pos in self._seen or len(self._seen) >= MAX_IFDS:
+        """The IFD at absolute ``pos`` (each one parsed once), or None when it's outside the file
+        or there are too many."""
+        key = (pos, self.base if base is None else base, order or self.order)
+        if key in self._parsed:
+            return self._parsed[key]
+        if len(self._parsed) >= MAX_IFDS:
             return None
-        self._seen.add(pos)
         try:
-            return read_ifd(self.data, pos, self.base if base is None else base, order or self.order)
+            found = read_ifd(self.data, pos, key[1], key[2])
         except (ValueError, struct.error):
-            return None
+            found = None
+        self._parsed[key] = found
+        return found
 
     def children(self, ifd: Ifd, tag: int) -> list[Ifd]:
         """The IFDs an offset tag (SubIFDs, EXIF, GPS) points at."""
@@ -171,10 +178,15 @@ class Tiff:
         return out
 
     def all_ifds(self) -> list[Ifd]:
-        """The main chain and every SubIFD under it, depth first."""
+        """The main chain and every SubIFD under it, depth first, each once (also when the file
+        points at one twice, or in a loop)."""
         out: list[Ifd] = []
+        seen: set[int] = set()
 
         def walk(ifd: Ifd, depth: int):
+            if id(ifd) in seen:
+                return
+            seen.add(id(ifd))
             out.append(ifd)
             if depth < 4:
                 for sub in self.children(ifd, SUBIFDS):
@@ -204,13 +216,6 @@ class Tiff:
                     self._gps = subs[0]
                     break
         return self._gps
-
-    def find(self, tag: int) -> Entry | None:
-        """The first entry with ``tag`` in IFD0's chain, its SubIFDs or the EXIF IFD."""
-        for ifd in self.all_ifds() + ([self.exif()] if self.exif() is not None else []):
-            if tag in ifd:
-                return ifd[tag]
-        return None
 
     def makernote(self) -> tuple[str, Ifd] | None:
         """(maker, IFD) for the maker note in the EXIF IFD, or None."""
@@ -249,13 +254,8 @@ def parse_makernote(tiff: Tiff, pos: int, size: int) -> tuple[str, Ifd] | None:
         maker, ifd = "sony", tiff.ifd(pos + 12)
     elif head.startswith(b"AOC\0"):
         # Pentax: offsets from the note's start in PEF files, from the TIFF base in JPEGs and DNGs
-        ifd = None
-        for base in (pos, tiff.base):
-            ifd = tiff.ifd(pos + 6, base, bo(pos + 4))
-            if ifd is not None and _plausible(ifd):
-                break
-            tiff._seen.discard(pos + 6)
-            ifd = None
+        tries = [t for t in (tiff.ifd(pos + 6, base, bo(pos + 4)) for base in (pos, tiff.base)) if t]
+        ifd = min(tries, key=lambda t: t.dropped) if tries else None  # the base that keeps its values in the file
         maker = "pentax"
     elif head.startswith(b"PENTAX \0"):
         maker, ifd = "pentax", tiff.ifd(pos + 10, pos, bo(pos + 8))
@@ -268,12 +268,6 @@ def parse_makernote(tiff: Tiff, pos: int, size: int) -> tuple[str, Ifd] | None:
         # Canon (and some Sony): the IFD itself, offsets from the TIFF base
         maker, ifd = "canon", tiff.ifd(pos)
     return None if ifd is None else (maker, ifd)
-
-
-def _plausible(ifd: Ifd) -> bool:
-    """Whether a maker note IFD parsed with a guessed base has its values inside the file."""
-    big = [e for e in ifd.values() if e.size > 4]
-    return bool(ifd) and len(big) >= 0 and all(e.pos >= 0 for e in big)
 
 
 # EXIF tags copied into exif_block's IFD0 (the rest of IFD0 describes the RAW data itself)
@@ -325,7 +319,7 @@ def exif_block(tiff: Tiff, ifd0: Ifd | None = None) -> bytes | None:
                 continue
             v = _le_value(e)
             if v is not None:
-                out.append((tag, 4 if e.type == 13 else e.type, e.count, v))
+                out.append((tag, e.type, e.count, v))
         return out
 
     main = copy(ifd0, _IFD0_KEEP) + [(274, 3, 1, struct.pack("<H", 1))]
