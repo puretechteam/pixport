@@ -107,6 +107,24 @@ def test_unpack_bits(bits, order):
 # DNG
 
 
+def test_dng_float_24_to_32():
+    words = [0x000000, 0x800000, 0x3F0000, 0xBF0000, 0x000001, 0x7EFFFF, 0x7F0000, 0xFF0000, 0x7F0001]
+    buf = b"".join(word.to_bytes(3, "big") for word in words)
+
+    out = dng._float_24_to_32(buf)
+
+    expected = np.array([0.0, -0.0, 1.0, -1.0, 2.0**-78, (2.0 - 2.0**-16) * 2.0**63], dtype=np.float32)
+    assert out.dtype == np.float32
+    np.testing.assert_array_equal(out[:6], expected)
+    assert np.isposinf(out[6]) and np.isneginf(out[7]) and np.isnan(out[8])
+    assert np.signbit(out[1]) and np.signbit(out[3]) and np.signbit(out[7])
+
+
+def test_dng_float_24_to_32_rejects_partial_sample():
+    with pytest.raises(PixportError, match="24-bit floating-point"):
+        dng._float_24_to_32(b"\x00\x00")
+
+
 DNG_TAGS0 = [(50721, 10, [(10000, 10000), (-3000, 10000), (-500, 10000), (-4000, 10000), (12000, 10000), (2000, 10000),
                           (-500, 10000), (1500, 10000), (6000, 10000)]),
              (50778, 3, [21]), (50728, 5, [(5, 10), (1, 1), (7, 10)])]

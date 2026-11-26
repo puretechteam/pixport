@@ -127,6 +127,33 @@ def _unpredict(a: np.ndarray, pred: int, spp: int, bits: int) -> np.ndarray:
     return a
 
 
+def _float_24_to_32(buf: bytes) -> np.ndarray:
+    """Convert big-endian DNG binary24 samples (1/7/16 bits, exponent bias 63) to float32."""
+    data = np.frombuffer(buf, np.uint8)
+    if data.size % 3:
+        raise PixportError("A DNG 24-bit floating-point sample is cut short")
+    octets = data.reshape(-1, 3).astype(np.uint32)
+    bits = (octets[:, 0] << 16) | (octets[:, 1] << 8) | octets[:, 2]
+    sign = (bits >> 23) & 1
+    exponent = (bits >> 16) & 0x7F
+    fraction = bits & 0xFFFF
+    fraction_bits = 16
+    exponent_bias = 63
+
+    values = np.empty(bits.shape, dtype=np.float64)
+    subnormal = exponent == 0
+    normal = (exponent > 0) & (exponent < 0x7F)
+    special = exponent == 0x7F
+    values[subnormal] = np.ldexp(fraction[subnormal].astype(np.float64), 1 - exponent_bias - fraction_bits)
+    values[normal] = np.ldexp(
+        1.0 + fraction[normal].astype(np.float64) / (1 << fraction_bits),
+        exponent[normal].astype(np.int32) - exponent_bias,
+    )
+    values[special] = np.where(fraction[special] == 0, np.inf, np.nan)
+    values = np.copysign(values, np.where(sign != 0, -1.0, 1.0))
+    return values.astype(np.float32)
+
+
 def _float_unpredict(buf: bytes, rows: int, cols: int, spp: int, nbytes: int, pred: int) -> np.ndarray:
     """Floating-point predictor (3, 34894 by 2, 34895 by 4): bytes differenced along the row,
     then reordered from byte planes (most significant first) to big-endian samples."""
