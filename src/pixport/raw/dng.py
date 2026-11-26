@@ -127,18 +127,20 @@ def _unpredict(a: np.ndarray, pred: int, spp: int, bits: int) -> np.ndarray:
     return a
 
 
-def _float_24_to_32(buf: bytes) -> np.ndarray:
-    """Convert big-endian DNG binary24 samples (1/7/16 bits, exponent bias 63) to float32."""
+def _float_24_to_32(buf: bytes, order: str = ">") -> np.ndarray:
+    """Convert DNG binary24 samples (1/7/16 bits, exponent bias 64) to float32."""
     data = np.frombuffer(buf, np.uint8)
     if data.size % 3:
         raise PixportError("A DNG 24-bit floating-point sample is cut short")
     octets = data.reshape(-1, 3).astype(np.uint32)
+    if order == "<":
+        octets = octets[:, ::-1]
     bits = (octets[:, 0] << 16) | (octets[:, 1] << 8) | octets[:, 2]
     sign = (bits >> 23) & 1
     exponent = (bits >> 16) & 0x7F
     fraction = bits & 0xFFFF
     fraction_bits = 16
-    exponent_bias = 63
+    exponent_bias = 64
 
     values = np.empty(bits.shape, dtype=np.float64)
     subnormal = exponent == 0
@@ -163,9 +165,11 @@ def _float_unpredict(buf: bytes, rows: int, cols: int, spp: int, nbytes: int, pr
     out = a.copy()
     for s in range(step):
         out[:, s::step] = np.cumsum(a[:, s::step], axis=1, dtype=np.uint64).astype(np.uint8)
-    if nbytes not in (2, 4):
+    if nbytes not in (2, 3, 4):
         raise UnsupportedError(f"{nbytes * 8}-bit floating-point DNG data isn't supported")
     planes = out.reshape(rows, nbytes, n).transpose(0, 2, 1)
+    if nbytes == 3:
+        return _float_24_to_32(np.ascontiguousarray(planes).tobytes()).reshape(rows, n)
     be = np.ascontiguousarray(planes).view(">f2" if nbytes == 2 else ">f4")
     return be.reshape(rows, n).astype(np.float32)
 
@@ -193,6 +197,10 @@ def _decode_tile(data: bytes, off: int, size: int, rows: int, cols: int, spp: in
                 if len(buf) < n * nb:
                     raise PixportError("A DNG Deflate tile is cut short")
                 return _float_unpredict(buf, rows, cols, spp, nb, pred)
+            if bits == 24:
+                if len(buf) < n * nb:
+                    raise PixportError("A DNG Deflate tile is cut short")
+                return _float_24_to_32(buf[:n * nb], order).reshape(rows, cols * spp)
             dt = {2: "f2", 4: "f4", 8: "f8"}.get(nb)
             if dt is None:
                 raise UnsupportedError(f"{bits}-bit floating-point DNG data isn't supported")
@@ -202,6 +210,10 @@ def _decode_tile(data: bytes, off: int, size: int, rows: int, cols: int, spp: in
     if comp == 1:
         if sample_format == 3:
             nb = bits // 8
+            if bits == 24:
+                if off + n * nb > end:
+                    raise PixportError("A DNG strip is cut short")
+                return _float_24_to_32(data[off:off + n * nb], order).reshape(rows, cols * spp)
             dt = {2: "f2", 4: "f4", 8: "f8"}.get(nb)
             if dt is None:
                 raise UnsupportedError(f"{bits}-bit floating-point DNG data isn't supported")

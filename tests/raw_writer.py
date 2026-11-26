@@ -5,6 +5,7 @@ tiles, every lossless JPEG predictor)."""
 from __future__ import annotations
 
 import struct
+import zlib
 
 import numpy as np
 
@@ -203,15 +204,61 @@ def ljpeg_encode(samples: np.ndarray, ncomp: int, predictor: int = 1, precision:
 # DNG
 
 
+def _dng_sample_bytes(samples: np.ndarray, bits: int, sample_format: int, order: str, predictor: int) -> bytes:
+    if sample_format == 3:
+        if bits == 24:
+            words = np.asarray(samples)
+            if not np.issubdtype(words.dtype, np.integer) or np.any(words < 0) or np.any(words > 0xFFFFFF):
+                raise ValueError("24-bit floating-point test samples must be encoded as 24-bit words")
+            words = words.astype(np.uint32, copy=False)
+            octets = np.empty(words.shape + (3,), dtype=np.uint8)
+            byte_order = ">" if predictor in (3, 34894, 34895) else order
+            if byte_order == ">":
+                octets[..., 0] = words >> 16
+                octets[..., 1] = words >> 8
+                octets[..., 2] = words
+            else:
+                octets[..., 0] = words
+                octets[..., 1] = words >> 8
+                octets[..., 2] = words >> 16
+            return octets.tobytes()
+        dtype = {16: "f2", 32: "f4", 64: "f8"}.get(bits)
+        if dtype is None:
+            raise ValueError(f"unsupported test float depth: {bits}")
+        byte_order = ">" if predictor in (3, 34894, 34895) else order
+        return samples.astype(np.dtype(byte_order + dtype)).tobytes()
+    return samples.astype(order + "u2").tobytes()
+
+
+def _dng_float_predictor(buf: bytes, rows: int, cols: int, spp: int, bits: int, pred: int) -> bytes:
+    n = cols * spp
+    nbytes = bits // 8
+    samples = np.frombuffer(buf, np.uint8).reshape(rows, n, nbytes)
+    planes = samples.transpose(0, 2, 1).reshape(rows, n * nbytes)
+    encoded = planes.copy()
+    step = spp * {3: 1, 34894: 2, 34895: 4}[pred]
+    for offset in range(step):
+        values = planes[:, offset::step].astype(np.int16)
+        previous = np.zeros_like(values)
+        previous[:, 1:] = values[:, :-1]
+        encoded[:, offset::step] = ((values - previous) & 0xFF).astype(np.uint8)
+    return encoded.tobytes()
+
+
 def dng(cfa: np.ndarray, order: str = "<", compression: int = 1, tile: int | None = None, bits: int = 16,
-        extra_raw: list | None = None, extra0: list | None = None, linear: bool = False) -> bytes:
-    """A DNG holding ``cfa`` (uint16, height x width, or height x width x 3 when ``linear``)."""
+        extra_raw: list | None = None, extra0: list | None = None, linear: bool = False, sample_format: int = 1,
+        predictor: int = 1) -> bytes:
+    """A DNG holding integer samples or floating-point samples (24-bit values are encoded words)."""
     t = Tiff(order)
     h, w = cfa.shape[:2]
     spp = 3 if linear else 1
     blobs = {}
     raw_entries = [(254, 4, [0]), (256, 4, [w]), (257, 4, [h]), (258, 3, [bits] * spp), (259, 3, [compression]),
                    (262, 3, [34892 if linear else 32803]), (277, 3, [spp]), (284, 3, [1])]
+    if sample_format != 1:
+        raw_entries.append((339, 3, [sample_format] * spp))
+    if predictor != 1:
+        raw_entries.append((317, 3, [predictor]))
     if not linear:
         raw_entries += [(33421, 3, [2, 2]), (33422, 1, [0, 1, 1, 2])]
     raw_entries += extra_raw or []
@@ -220,13 +267,21 @@ def dng(cfa: np.ndarray, order: str = "<", compression: int = 1, tile: int | Non
         offs, sizes = [], []
         for ty in range(0, h, tile):
             for tx in range(0, w, tile):
-                piece = np.zeros((tile, tile * spp), np.uint16)
+                piece = np.zeros((tile, tile * spp), dtype=cfa.dtype)
                 part = flat[ty:ty + tile, tx * spp:(tx + tile) * spp]
                 piece[:part.shape[0], :part.shape[1]] = part
                 if compression == 7:
                     b = ljpeg_encode(piece.reshape(tile, -1), 2 if not linear else 3, precision=bits)
                 else:
-                    b = piece.astype(order + "u2").tobytes()
+                    b = _dng_sample_bytes(piece, bits, sample_format, order, predictor)
+                    if compression == 8:
+                        if sample_format == 3 and predictor in (3, 34894, 34895):
+                            b = _dng_float_predictor(b, tile, tile, spp, bits, predictor)
+                        elif predictor != 1:
+                            raise ValueError("this test writer only supports floating-point predictors")
+                        b = zlib.compress(b)
+                    elif predictor != 1:
+                        raise ValueError("predictors in this test writer require Deflate compression")
                 name = f"t{len(offs)}"
                 blobs[name] = b
                 offs.append(name)
@@ -238,15 +293,26 @@ def dng(cfa: np.ndarray, order: str = "<", compression: int = 1, tile: int | Non
         if compression == 7:
             b = ljpeg_encode(flat.reshape(h, -1), 2 if not linear else 3, precision=bits)
         else:
-            b = flat.astype(order + "u2").tobytes()
+            b = _dng_sample_bytes(flat, bits, sample_format, order, predictor)
+            if compression == 8:
+                if sample_format == 3 and predictor in (3, 34894, 34895):
+                    b = _dng_float_predictor(b, h, w, spp, bits, predictor)
+                elif predictor != 1:
+                    raise ValueError("this test writer only supports floating-point predictors")
+                b = zlib.compress(b)
+            elif predictor != 1:
+                raise ValueError("predictors in this test writer require Deflate compression")
         blobs["strip"] = b
         raw_entries += [(273, 4, ("@strip",)), (279, 4, [len(b)]), (278, 4, [h])]
         tile_offsets = None
     if tile_offsets:
         raw_entries.append((324, 4, tuple("@" + n for n in tile_offsets)))
     raw = {"entries": raw_entries}
-    ifd0 = {"entries": [(254, 4, [1]), (256, 4, [8]), (257, 4, [8]), (271, 2, "Pixtest"), (272, 2, "Model One"),
-                        (274, 3, [1]), (50706, 1, [1, 4, 0, 0])] + (extra0 or []),
+    ifd0_entries = [(254, 4, [1]), (256, 4, [8]), (257, 4, [8]), (271, 2, "Pixtest"), (272, 2, "Model One"),
+                    (274, 3, [1]), (50706, 1, [1, 4, 0, 0])]
+    if sample_format == 3 or compression == 8:
+        ifd0_entries.append((50707, 1, [1, 4, 0, 0]))
+    ifd0 = {"entries": ifd0_entries + (extra0 or []),
             "children": {330: [raw]}}
     data = t.build([ifd0], blobs)
     return data

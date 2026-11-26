@@ -2,6 +2,10 @@
 
 Newest first.
 
+## Unreleased
+
+- Read 24-bit floating-point DNG samples, including Deflate data with floating-point predictors.
+
 ## 2026-11-12: pixport 0.2.0, a pixel budget, neutral HDR colours, faster RAW and a hardening pass
 
 - **Greys stay grey in EXR and HDR with a non-D65 white**: the chromaticities are now adapted to D65 with the Bradford transform. ACES AP0 grey (D60) came out sRGB (1.047, 0.995, 0.915) and now comes out (1.000, 1.000, 1.000); XYZE white (1, 1, 1) came out (1.205, 0.948, 0.909) and now comes out (1.000, 1.000, 1.000). A D65 file is unchanged.

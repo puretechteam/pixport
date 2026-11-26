@@ -108,21 +108,87 @@ def test_unpack_bits(bits, order):
 
 
 def test_dng_float_24_to_32():
-    words = [0x000000, 0x800000, 0x3F0000, 0xBF0000, 0x000001, 0x7EFFFF, 0x7F0000, 0xFF0000, 0x7F0001]
+    words = [0x000000, 0x800000, 0x400000, 0xC00000, 0x3F0000, 0x000001, 0x7EFFFF, 0x7F0000, 0xFF0000, 0x7F0001]
     buf = b"".join(word.to_bytes(3, "big") for word in words)
 
     out = dng._float_24_to_32(buf)
 
-    expected = np.array([0.0, -0.0, 1.0, -1.0, 2.0**-78, (2.0 - 2.0**-16) * 2.0**63], dtype=np.float32)
+    expected = np.array([0.0, -0.0, 1.0, -1.0, 0.5, 2.0**-79, (2.0 - 2.0**-16) * 2.0**62], dtype=np.float32)
     assert out.dtype == np.float32
-    np.testing.assert_array_equal(out[:6], expected)
-    assert np.isposinf(out[6]) and np.isneginf(out[7]) and np.isnan(out[8])
-    assert np.signbit(out[1]) and np.signbit(out[3]) and np.signbit(out[7])
+    np.testing.assert_array_equal(out[:7], expected)
+    assert np.isposinf(out[7]) and np.isneginf(out[8]) and np.isnan(out[9])
+    assert np.signbit(out[1]) and np.signbit(out[3]) and np.signbit(out[8])
+
+
+def test_dng_float_24_to_32_little_endian():
+    assert dng._float_24_to_32(b"\x00\x00\x40", "<")[0] == np.float32(1.0)
 
 
 def test_dng_float_24_to_32_rejects_partial_sample():
     with pytest.raises(PixportError, match="24-bit floating-point"):
         dng._float_24_to_32(b"\x00\x00")
+
+
+def _float_predictor_24(words, pred):
+    rows, cols = len(words), len(words[0])
+    samples = np.frombuffer(
+        b"".join(word.to_bytes(3, "big") for row in words for word in row),
+        np.uint8,
+    ).reshape(rows, cols, 3)
+    planes = samples.transpose(0, 2, 1).reshape(rows, -1)
+    encoded = planes.copy()
+    step = {3: 1, 34894: 2, 34895: 4}[pred]
+    for offset in range(step):
+        values = planes[:, offset::step].astype(np.int16)
+        previous = np.zeros_like(values)
+        previous[:, 1:] = values[:, :-1]
+        encoded[:, offset::step] = ((values - previous) & 0xFF).astype(np.uint8)
+    return encoded.tobytes()
+
+
+@pytest.mark.parametrize("pred", [3, 34894, 34895])
+def test_dng_float_24_predictor(pred):
+    words = [
+        [0x400000, 0xC00000, 0x000001, 0x7EFFFF],
+        [0x000000, 0x800000, 0x7F0000, 0x7F0001],
+    ]
+    buf = _float_predictor_24(words, pred)
+
+    out = dng._float_unpredict(buf, 2, 4, 1, 3, pred)
+
+    expected = np.array(
+        [[1.0, -1.0, 2.0**-79, (2.0 - 2.0**-16) * 2.0**62],
+         [0.0, -0.0, np.inf, np.nan]],
+        dtype=np.float32,
+    )
+    np.testing.assert_array_equal(out, expected)
+
+
+@pytest.mark.parametrize("order", ["<", ">"])
+@pytest.mark.parametrize("compression,predictor", [(1, 1), (8, 1), (8, 3), (8, 34894), (8, 34895)])
+def test_dng_float_24_decode(tmp_path, order, compression, predictor):
+    words = np.array(
+        [[0x000000, 0x800000, 0x400000, 0xC00000, 0x000001],
+         [0x7EFFFF, 0x7F0000, 0xFF0000, 0x7F0001, 0x410000]],
+        dtype=np.uint32,
+    )
+    expected = np.array(
+        [[0.0, -0.0, 1.0, -1.0, 2.0**-79],
+         [(2.0 - 2.0**-16) * 2.0**62, np.inf, -np.inf, np.nan, 2.0]],
+        dtype=np.float32,
+    )
+    float24_path = tmp_path / "float24.dng"
+    float24_path.write_bytes(
+        make_dng(words, order, compression, bits=24, sample_format=3, predictor=predictor)
+    )
+    float32_path = tmp_path / "float32.dng"
+    float32_path.write_bytes(make_dng(expected, order, bits=32, sample_format=3))
+
+    raw24 = dng.decode(float24_path)
+    raw32 = dng.decode(float32_path)
+
+    assert raw24.cfa is not None and raw32.cfa is not None
+    np.testing.assert_array_equal(raw24.cfa, raw32.cfa)
 
 
 DNG_TAGS0 = [(50721, 10, [(10000, 10000), (-3000, 10000), (-500, 10000), (-4000, 10000), (12000, 10000), (2000, 10000),
