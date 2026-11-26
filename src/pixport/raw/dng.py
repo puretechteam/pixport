@@ -128,7 +128,7 @@ def _unpredict(a: np.ndarray, pred: int, spp: int, bits: int) -> np.ndarray:
 
 
 def _float_24_to_32(buf: bytes, order: str = ">") -> np.ndarray:
-    """Convert DNG binary24 samples (1/7/16 bits, exponent bias 64) to float32."""
+    """Convert DNG binary24 samples (1/7/16 bits, exponent bias 63) to float32."""
     data = np.frombuffer(buf, np.uint8)
     if data.size % 3:
         raise PixportError("A DNG 24-bit floating-point sample is cut short")
@@ -140,7 +140,7 @@ def _float_24_to_32(buf: bytes, order: str = ">") -> np.ndarray:
     exponent = (bits >> 16) & 0x7F
     fraction = bits & 0xFFFF
     fraction_bits = 16
-    exponent_bias = 64
+    exponent_bias = 63
 
     values = np.empty(bits.shape, dtype=np.float64)
     subnormal = exponent == 0

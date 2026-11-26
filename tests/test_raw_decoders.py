@@ -108,12 +108,12 @@ def test_unpack_bits(bits, order):
 
 
 def test_dng_float_24_to_32():
-    words = [0x000000, 0x800000, 0x400000, 0xC00000, 0x3F0000, 0x000001, 0x7EFFFF, 0x7F0000, 0xFF0000, 0x7F0001]
+    words = [0x000000, 0x800000, 0x3F0000, 0xBF0000, 0x3E0000, 0x000001, 0x7EFFFF, 0x7F0000, 0xFF0000, 0x7F0001]
     buf = b"".join(word.to_bytes(3, "big") for word in words)
 
     out = dng._float_24_to_32(buf)
 
-    expected = np.array([0.0, -0.0, 1.0, -1.0, 0.5, 2.0**-79, (2.0 - 2.0**-16) * 2.0**62], dtype=np.float32)
+    expected = np.array([0.0, -0.0, 1.0, -1.0, 0.5, 2.0**-78, (2.0 - 2.0**-16) * 2.0**63], dtype=np.float32)
     assert out.dtype == np.float32
     np.testing.assert_array_equal(out[:7], expected)
     assert np.isposinf(out[7]) and np.isneginf(out[8]) and np.isnan(out[9])
@@ -121,7 +121,25 @@ def test_dng_float_24_to_32():
 
 
 def test_dng_float_24_to_32_little_endian():
-    assert dng._float_24_to_32(b"\x00\x00\x40", "<")[0] == np.float32(1.0)
+    assert dng._float_24_to_32(b"\x00\x00\x3f", "<")[0] == np.float32(1.0)
+
+
+def test_dng_float_24_to_32_matches_float32_reference():
+    rng = np.random.default_rng(24)
+    sign = rng.integers(0, 2, 1024, dtype=np.uint32) << 31
+    exponent = rng.integers(65, 191, 1024, dtype=np.uint32) << 23
+    fraction = rng.integers(0, 1 << 16, 1024, dtype=np.uint32) << 7
+    reference_bits = sign | exponent | fraction
+    reference = reference_bits.view(np.float32)
+
+    binary24_words = (
+        ((reference_bits >> 8) & 0x800000)
+        | ((((reference_bits >> 23) & 0xFF) - 64) << 16)
+        | ((reference_bits & 0x7FFFFF) >> 7)
+    )
+    buf = b"".join(int(word).to_bytes(3, "big") for word in binary24_words)
+
+    np.testing.assert_array_equal(dng._float_24_to_32(buf), reference)
 
 
 def test_dng_float_24_to_32_rejects_partial_sample():
@@ -149,7 +167,7 @@ def _float_predictor_24(words, pred):
 @pytest.mark.parametrize("pred", [3, 34894, 34895])
 def test_dng_float_24_predictor(pred):
     words = [
-        [0x400000, 0xC00000, 0x000001, 0x7EFFFF],
+        [0x3F0000, 0xBF0000, 0x000001, 0x7EFFFF],
         [0x000000, 0x800000, 0x7F0000, 0x7F0001],
     ]
     buf = _float_predictor_24(words, pred)
@@ -157,7 +175,7 @@ def test_dng_float_24_predictor(pred):
     out = dng._float_unpredict(buf, 2, 4, 1, 3, pred)
 
     expected = np.array(
-        [[1.0, -1.0, 2.0**-79, (2.0 - 2.0**-16) * 2.0**62],
+        [[1.0, -1.0, 2.0**-78, (2.0 - 2.0**-16) * 2.0**63],
          [0.0, -0.0, np.inf, np.nan]],
         dtype=np.float32,
     )
@@ -166,23 +184,24 @@ def test_dng_float_24_predictor(pred):
 
 @pytest.mark.parametrize("order", ["<", ">"])
 @pytest.mark.parametrize("compression,predictor", [(1, 1), (8, 1), (8, 3), (8, 34894), (8, 34895)])
-def test_dng_float_24_decode(tmp_path, order, compression, predictor):
+@pytest.mark.parametrize("tile", [None, 4])
+def test_dng_float_24_decode(tmp_path, order, compression, predictor, tile):
     words = np.array(
-        [[0x000000, 0x800000, 0x400000, 0xC00000, 0x000001],
-         [0x7EFFFF, 0x7F0000, 0xFF0000, 0x7F0001, 0x410000]],
+        [[0x000000, 0x800000, 0x3F0000, 0xBF0000, 0x000001],
+         [0x7EFFFF, 0x7F0000, 0xFF0000, 0x7F0001, 0x400000]],
         dtype=np.uint32,
     )
     expected = np.array(
-        [[0.0, -0.0, 1.0, -1.0, 2.0**-79],
-         [(2.0 - 2.0**-16) * 2.0**62, np.inf, -np.inf, np.nan, 2.0]],
+        [[0.0, -0.0, 1.0, -1.0, 2.0**-78],
+         [(2.0 - 2.0**-16) * 2.0**63, np.inf, -np.inf, np.nan, 2.0]],
         dtype=np.float32,
     )
     float24_path = tmp_path / "float24.dng"
     float24_path.write_bytes(
-        make_dng(words, order, compression, bits=24, sample_format=3, predictor=predictor)
+        make_dng(words, order, compression, tile=tile, bits=24, sample_format=3, predictor=predictor)
     )
     float32_path = tmp_path / "float32.dng"
-    float32_path.write_bytes(make_dng(expected, order, bits=32, sample_format=3))
+    float32_path.write_bytes(make_dng(expected, order, tile=tile, bits=32, sample_format=3))
 
     raw24 = dng.decode(float24_path)
     raw32 = dng.decode(float32_path)
