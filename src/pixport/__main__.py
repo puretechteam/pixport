@@ -28,16 +28,17 @@ def main(argv: list[str] | None = None) -> int:
     if not a.src or not a.dst:
         ap.error("give a picture to read and a file to write")
     try:
-        img = read(a.src)
         dst = Path(a.dst)
         ext = dst.suffix.lower().lstrip(".")
+        own = ext not in ("png", "tif", "tiff") and ext in {k for k, v in formats().items() if v["write"]}
+        if own and a.exposure is not None:  # checked before reading: decoding a big picture takes a while
+            raise PixportError(f"--exposure is not supported for {ext.upper()} output")
+        if own and a.bits is not None:
+            raise PixportError(f"--bits is not supported for {ext.upper()} output")
+        img = read(a.src)
         if ext in ("png", "tif", "tiff"):
             write(img, dst, bits=a.bits, exposure=a.exposure or 0.0)
-        elif ext in {k for k, v in formats().items() if v["write"]}:
-            if a.exposure is not None:
-                raise PixportError(f"--exposure is not supported for {ext.upper()} output")
-            if a.bits is not None:
-                raise PixportError(f"--bits is not supported for {ext.upper()} output")
+        elif own:
             write(img, dst)
         else:
             pil = img.to_pil(bits=a.bits or 8, exposure=a.exposure or 0.0)
