@@ -436,6 +436,24 @@ def test_the_command_line_takes_bits_and_exposure(tmp_path):
         assert r.returncode == 1 and "Traceback" not in r.stderr and "pixport:" in r.stderr
 
 
+@pytest.mark.parametrize("extension", ["exr", "hdr", "jxl"])
+@pytest.mark.parametrize("option,value", [("--exposure", "3"), ("--bits", "16")])
+def test_cli_rejects_unsupported_output_options(tmp_path, extension, option, value):
+    src = tmp_path / "source.hdr"
+    dst = tmp_path / f"output.{extension}"
+    pixport.write(Image(np.full((4, 4, 3), 0.25, np.float32), "linear"), src)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pixport", str(src), str(dst), option, value],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+
+    assert result.returncode == 1
+    assert f"pixport: {option} is not supported for {extension.upper()} output" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not dst.exists()
+
+
 def test_a_budget_below_one_pixel_is_a_mistake_in_the_call_not_damage(tmp_path):
     p = tmp_path / "small.xcf"
     p.write_bytes(_empty_xcf(8, 8))

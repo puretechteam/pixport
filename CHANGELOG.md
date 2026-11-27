@@ -4,6 +4,7 @@ Newest first.
 
 ## Unreleased
 
+- **Fixed: `--exposure` and `--bits` were ignored without a word for EXR, HDR and JPEG XL output.** The command now stops with an error saying which option that output doesn't support, and writes nothing; PNG, TIFF and the Pillow formats are unchanged. Contributed by [@Crazy-ChenMiLin](https://github.com/Crazy-ChenMiLin) in [#7](https://github.com/puretechteam/pixport/pull/7).
 - **Added: 24-bit floating-point DNG samples are read**, uncompressed or Deflate, with or without the floating-point predictors, in either byte order, from strips or tiles. Contributed by [@jonhsmi](https://github.com/jonhsmi) in [#8](https://github.com/puretechteam/pixport/pull/8).
 
 ## 2026-11-12: pixport 0.2.0, a pixel budget, neutral HDR colours, faster RAW and a hardening pass

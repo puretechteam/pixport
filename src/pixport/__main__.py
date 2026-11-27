@@ -16,7 +16,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("dst", nargs="?")
     ap.add_argument("--bits", type=int, choices=(8, 16), default=None,
                     help="bits per channel for PNG/TIFF (default: 16 for RAW, EXR, HDR and high-bit XCF, else 8)")
-    ap.add_argument("--exposure", type=float, default=0.0, help="stops brighter (+) or darker (-) for EXR/HDR")
+    ap.add_argument("--exposure", type=float,
+                    help="stops brighter (+) or darker (-) for linear input when writing PNG, TIFF or via Pillow")
     ap.add_argument("--formats", action="store_true", help="list the formats and exit")
     ap.add_argument("--version", action="version", version=f"pixport {__version__}")
     a = ap.parse_args(argv)
@@ -31,11 +32,15 @@ def main(argv: list[str] | None = None) -> int:
         dst = Path(a.dst)
         ext = dst.suffix.lower().lstrip(".")
         if ext in ("png", "tif", "tiff"):
-            write(img, dst, bits=a.bits, exposure=a.exposure)
+            write(img, dst, bits=a.bits, exposure=a.exposure or 0.0)
         elif ext in {k for k, v in formats().items() if v["write"]}:
+            if a.exposure is not None:
+                raise PixportError(f"--exposure is not supported for {ext.upper()} output")
+            if a.bits is not None:
+                raise PixportError(f"--bits is not supported for {ext.upper()} output")
             write(img, dst)
         else:
-            pil = img.to_pil(bits=a.bits or 8, exposure=a.exposure)
+            pil = img.to_pil(bits=a.bits or 8, exposure=a.exposure or 0.0)
             pil.save(dst)
     except PixportError as e:
         print(f"pixport: {e}", file=sys.stderr)
